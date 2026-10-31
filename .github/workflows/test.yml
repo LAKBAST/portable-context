@@ -7,8 +7,7 @@ on:
 
 jobs:
   test:
-    # The organization's runners on the Geekom, which only run Linux.
-    runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
+    runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
@@ -20,7 +19,7 @@ jobs:
           node-version: ${{ matrix.node }}
       - run: npm test
 
-  # GitHub's Windows runners use the account's Actions minutes, so this one is started by hand.
+  # Started by hand to keep routine runs short.
   test-windows:
     if: github.event_name == 'workflow_dispatch'
     runs-on: windows-latest
