@@ -16,7 +16,7 @@ import {
   stagedFindings,
   sync,
 } from './context.js';
-import { install, status, uninstall } from './integrations.js';
+import { install, removeSkill, status, uninstall } from './integrations.js';
 
 const DEFAULT_SKILL = 'save-context';
 
@@ -74,10 +74,13 @@ function runSetup(positionals, values) {
     skillName: slug(values['skill-name'] ?? previous?.skillName ?? DEFAULT_SKILL),
   };
   const { seeded } = setupContextRepo(url, config.contextDir);
+  // Saved only after install, so a refused install keeps the previous skill name.
+  const installed = install(config);
   saveConfig(config);
+  if (previous?.skillName && previous.skillName !== config.skillName) removeSkill(previous.skillName);
   console.log(`Context repo: ${config.contextDir}${seeded ? ' (seeded from the template)' : ''}`);
   console.log(`Device: ${config.device}`);
-  printInstalled(install(config));
+  printInstalled(installed);
   return 0;
 }
 

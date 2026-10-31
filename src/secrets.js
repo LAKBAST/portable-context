@@ -11,7 +11,9 @@ const RULES = [
   ['connection-string', /\b[a-z][a-z0-9+.-]*:\/\/[^\s:@/]*:[^\s@/]+@[^\s/]+/i],
 ];
 
-const GENERIC = /(?:api[_-]?key|secret|token|password)[\w.-]*["'`*\]]*\s*[:=]\s*["'`]?[^\s"'`]{16,}/i;
+// The lookahead skips references to a secret, which are safe and common in notes about code.
+const GENERIC =
+  /(?:api[_-]?key|secret|token|password)[\w.-]*["'`*\]]*\s*[:=]\s*["'`]?(?!process\.env\.|os\.environ|import\.meta\.env\.|\$\{)[^\s"'`]{16,}/i;
 
 const HUNK = /^@@ -\d+(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/;
 

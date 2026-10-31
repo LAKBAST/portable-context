@@ -18,12 +18,18 @@ No npm dependencies.
 
 ## Install
 
+Run these in a normal terminal, not as administrator or with `sudo`. Files created with elevated rights can make git refuse the repo later (`dubious ownership`).
+
 ```sh
-git clone https://github.com/LAKBAST/portable-context.git ~/.pctx/tool
-npm install -g ~/.pctx/tool
+git clone https://github.com/LAKBAST/portable-context.git "$HOME/.pctx/tool"
+npm install -g "$HOME/.pctx/tool"
 ```
 
-To update, run `git pull` in `~/.pctx/tool`. The hook and skill point at this folder, so keep it in place.
+`npm install -g github:...` does not work on npm 12, which refuses git packages by default.
+
+On Windows PowerShell, if scripts are disabled (`npm.ps1` cannot be loaded), use `npm.cmd` and `pctx.cmd` in every command here. You do not need to change the execution policy, and the hook and skill are not affected because they call `node` directly.
+
+To update, run `git pull` in `$HOME/.pctx/tool`. The hook and skill point at this folder, so keep it in place.
 
 ## Create your context repo (once)
 
@@ -40,7 +46,15 @@ Options: `--dir <path>` (where to clone), `--device <name>` (appears in session 
 
 ## Add another device
 
-Install `pctx` the same way, then run `pctx setup <same-url>` with a different `--device` name. The existing repo is cloned and its contents are used as is.
+Install `pctx` the same way, then run `pctx setup <same-url>`, with the same `--skill-name` if you changed it. The existing repo is cloned and its contents are used as is. The device name defaults to the computer's hostname; use `--device` only if two devices share one.
+
+## Move the context repo
+
+If the repo changes URL, update each device that already has it:
+
+```sh
+git -C "$HOME/.pctx/context" remote set-url origin <new-url>
+```
 
 ## Approve the hook in Codex
 
@@ -52,6 +66,10 @@ Codex asks you to trust new hooks. Start Codex and run `/hooks` to review and ap
 - Codex: `$save-context`
 
 The agent writes `sessions/YYYY-MM-DD-HHmm-<project>-<device>.md` (path from `pctx session-path`) and runs `pctx sync`.
+
+## Edit your profile
+
+Replace the template text in `AGENTS.md` inside your context repo (`~/.pctx/context` by default) with your own preferences, then run `pctx sync`. It is loaded in every session on every device, so keep it short.
 
 ## Commands
 
@@ -82,6 +100,8 @@ Secret scanning runs before each commit and blocks known token and private key p
 
 - The mobile apps and claude.ai do not run hooks or local skills, so they cannot load or save context.
 - Conflicting edits to the same file on two devices are not merged automatically; `sync` reports `local-only` and you resolve it in the context repo with git.
+- If unsaved edits clash with newer changes when a session starts, they are moved to `git stash` and the agent is told to warn you. Run `git stash pop` in the context repo to get them back.
+- Commit signing (`commit.gpgsign`) has not been tested and may make saves fail.
 
 ## Uninstall
 

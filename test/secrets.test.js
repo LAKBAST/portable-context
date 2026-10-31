@@ -83,3 +83,19 @@ test('scanDiff reports file and line number per hunk', () => {
 test('scanDiff returns [] for empty input', () => {
   assert.deepEqual(scanDiff(''), []);
 });
+
+test('scanDiff ignores references to a secret but still flags literal values', () => {
+  const diff = (line) => `diff --git a/n.md b/n.md\n--- a/n.md\n+++ b/n.md\n@@ -0,0 +1 @@\n+${line}\n`;
+  for (const reference of [
+    'token=process.env.GITHUB_TOKEN',
+    'apiKey: process.env.STRIPE_SECRET_KEY',
+    'password = os.environ["DATABASE_PASSWORD"]',
+    'secret: import.meta.env.VITE_SECRET_VALUE',
+    'API_KEY=${MY_LONG_API_KEY_VALUE}',
+  ]) {
+    assert.deepEqual(scanDiff(diff(reference)), [], reference);
+  }
+  const literal = scanDiff(diff('password=' + 'x7Q2'.repeat(5)));
+  assert.equal(literal.length, 1);
+  assert.equal(literal[0].rule, 'generic-secret');
+});

@@ -230,6 +230,10 @@ export function uninstall(config) {
   return removed;
 }
 
+export function removeSkill(name) {
+  for (const target of targets()) uninstallSkill(target, name);
+}
+
 function hookStatus(target) {
   try {
     return { hook: hasOurHook(readJson(target.hookFile)) };

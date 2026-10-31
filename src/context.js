@@ -103,7 +103,9 @@ export function setupContextRepo(url, dir) {
   const target = resolve(dir);
   if (existsSync(join(target, '.git'))) {
     const origin = git(target, ['config', '--get', 'remote.origin.url']).stdout.trim();
-    if (origin !== url) throw new Error(`${target} already has origin ${origin || '(none)'}, expected ${url}`);
+    if (origin !== url) {
+      throw new Error(`${target} already has origin ${origin || '(none)'}, expected ${url}. If the repo moved, run: git -C "${target}" remote set-url origin ${url}`);
+    }
   } else {
     mkdirSync(dirname(target), { recursive: true });
     const clone = git(dirname(target), ['clone', '-q', '--', url, target], { timeout: CLONE_TIMEOUT });
@@ -118,10 +120,21 @@ function rebaseInProgress(dir) {
   return existsSync(join(dir, '.git', 'rebase-merge')) || existsSync(join(dir, '.git', 'rebase-apply'));
 }
 
+function stashCount(dir) {
+  return git(dir, ['stash', 'list']).stdout.split('\n').filter(Boolean).length;
+}
+
 function pullRebase(dir) {
+  const stashed = stashCount(dir);
   // Replaying local commits needs a committer identity too.
   const pull = git(dir, [...identityArgs(dir), 'pull', '-q', '--rebase', '--autostash'], { timeout: PULL_TIMEOUT });
-  if (pull.ok) return { ok: true };
+  if (pull.ok) {
+    // git exits 0 when the autostash cannot be reapplied, which would hide the user's edits.
+    if (stashCount(dir) > stashed) {
+      return { ok: false, message: `Uncommitted edits clash with newer changes and were moved to git stash; run "git stash pop" in ${dir}` };
+    }
+    return { ok: true };
+  }
   if (rebaseInProgress(dir)) {
     git(dir, ['rebase', '--abort']);
     return { ok: false, conflict: true, message: `Conflict pulling the context repo; resolve it by hand in ${dir}` };

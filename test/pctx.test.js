@@ -412,6 +412,82 @@ test('conflicting edits to the same project file give local-only and no stuck re
   assert.equal(remoteText.replace(/\r\n/g, '\n'), 'edit from A\n');
 });
 
+test('hook warns when uncommitted edits clash with newer changes and keeps them in the stash', () => {
+  const sb = makeSandbox();
+  const a = makeDevice(sb, 'laptop');
+  const b = makeDevice(sb, 'desktop');
+  setup(a, sb);
+  setup(b, sb);
+
+  write(path.join(a.context, 'AGENTS.md'), 'profile from A\n');
+  assert.equal(pctx(a, ['sync']).status, 0);
+  write(path.join(b.context, 'AGENTS.md'), 'unsaved profile from B\n');
+
+  const h = hook(b, b.work);
+  assert.equal(h.status, 0, h.stderr);
+  assert.match(h.stdout, /WARNING: .*git stash/);
+  const stashed = git(['-C', b.context, 'stash', 'list']).stdout;
+  assert.ok(stashed.trim(), 'the edits should still be in the stash');
+  const kept = git(['-C', b.context, 'show', 'stash@{0}:AGENTS.md']).stdout;
+  assert.match(kept, /unsaved profile from B/);
+});
+
+test('hook keeps uncommitted edits in place when they do not clash', () => {
+  const sb = makeSandbox();
+  const a = makeDevice(sb, 'laptop');
+  const b = makeDevice(sb, 'desktop');
+  setup(a, sb);
+  setup(b, sb);
+
+  write(path.join(a.context, 'projects', 'other.md'), 'from A\n');
+  assert.equal(pctx(a, ['sync']).status, 0);
+  write(path.join(b.context, 'AGENTS.md'), 'unsaved profile from B\n');
+
+  const h = hook(b, b.work);
+  assert.doesNotMatch(h.stdout, /WARNING/);
+  assert.match(fs.readFileSync(path.join(b.context, 'AGENTS.md'), 'utf8'), /unsaved profile from B/);
+  assert.equal(git(['-C', b.context, 'stash', 'list']).stdout.trim(), '');
+});
+
+test('setup with a new --skill-name removes the old skill', () => {
+  const sb = makeSandbox();
+  const a = makeDevice(sb, 'laptop');
+  setup(a, sb);
+  setup(a, sb, ['--skill-name', 'guardar']);
+  assert.ok(fs.existsSync(path.join(a.claude, 'skills', 'guardar', 'SKILL.md')));
+  assert.ok(!fs.existsSync(path.join(a.claude, 'skills', 'save-context')));
+  assert.ok(!fs.existsSync(path.join(a.home, '.agents', 'skills', 'save-context')));
+});
+
+test('setup refused by a foreign skill keeps the previous skill name', () => {
+  const sb = makeSandbox();
+  const a = makeDevice(sb, 'laptop');
+  setup(a, sb);
+  write(path.join(a.claude, 'skills', 'taken', 'SKILL.md'), FOREIGN_SKILL);
+  const r = pctx(a, ['setup', sb.remote, '--device', a.name, '--skill-name', 'taken']);
+  assert.equal(r.status, 1, r.stdout);
+  assert.equal(readJson(path.join(a.pctxHome, 'config.json')).skillName, 'save-context');
+  assert.ok(fs.existsSync(path.join(a.claude, 'skills', 'save-context', 'SKILL.md')));
+});
+
+test('setup against a moved repo explains how to update the remote', () => {
+  const sb = makeSandbox();
+  const a = makeDevice(sb, 'laptop');
+  setup(a, sb);
+  const r = pctx(a, ['setup', `${sb.remote}-moved`, '--device', a.name]);
+  assert.equal(r.status, 1, r.stdout);
+  assert.match(r.stderr, /remote set-url origin/);
+});
+
+test('the Codex context limit sits on the hook, not on the matcher entry', () => {
+  const sb = makeSandbox();
+  const a = makeDevice(sb, 'laptop');
+  setup(a, sb);
+  const [entry] = readJson(path.join(a.codex, 'hooks.json')).hooks.SessionStart;
+  assert.equal(entry.additionalContextLimit, undefined);
+  assert.equal(entry.hooks[0].additionalContextLimit, 9000);
+});
+
 // ---------------------------------------------------------------- install / uninstall
 
 test('install preserves existing settings and hooks and creates a backup', () => {
