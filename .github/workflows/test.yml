@@ -3,14 +3,30 @@ name: test
 on:
   push:
   pull_request:
+  workflow_dispatch:
 
 jobs:
   test:
-    runs-on: ${{ matrix.os }}
+    # The organization's runners on the Geekom, which only run Linux.
+    runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        node: [20, 24]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      - run: npm test
+
+  # GitHub's Windows runners use the account's Actions minutes, so this one is started by hand.
+  test-windows:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
         node: [20, 24]
     steps:
       - uses: actions/checkout@v4
