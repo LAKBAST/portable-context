@@ -19,8 +19,11 @@ No npm dependencies.
 ## Install
 
 ```sh
-npm install -g github:LAKBAST/portable-context
+git clone https://github.com/LAKBAST/portable-context.git ~/.pctx/tool
+npm install -g ~/.pctx/tool
 ```
+
+To update, run `git pull` in `~/.pctx/tool`. The hook and skill point at this folder, so keep it in place.
 
 ## Create your context repo (once)
 
