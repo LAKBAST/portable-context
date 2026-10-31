@@ -117,3 +117,7 @@ This removes the hook and skill. Your context repo and `~/.pctx` are left in pla
 ```sh
 npm test
 ```
+
+## License
+
+[MIT](LICENSE)

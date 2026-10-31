@@ -4,7 +4,7 @@
   "description": "One private git repo of markdown context shared by Claude Code and Codex across devices.",
   "type": "module",
   "private": true,
-  "license": "UNLICENSED",
+  "license": "MIT",
   "bin": {
     "pctx": "bin/pctx.js"
   },
