@@ -1,0 +1,22 @@
+{
+  "name": "@lakbast/portable-context",
+  "version": "0.1.0",
+  "description": "One private git repo of markdown context shared by Claude Code and Codex across devices.",
+  "type": "module",
+  "private": true,
+  "license": "UNLICENSED",
+  "bin": {
+    "pctx": "bin/pctx.js"
+  },
+  "files": [
+    "bin",
+    "src",
+    "template"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.js"
+  }
+}
