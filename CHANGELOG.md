@@ -2,6 +2,12 @@
 
 All notable changes to this project are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses [Semantic Versioning](https://semver.org/).
 
+## [0.4.0] - 2026-11-11
+
+### Added
+
+- `pctx install` writes `~/.codex/rules/pctx.rules`, a Codex rule that lets the save skill run `pctx sync` without approval, so Codex's automatic review no longer stops a save because the notes mention internal infrastructure. `pctx uninstall` removes it, and `pctx doctor` reports it.
+
 ## [0.3.0] - 2026-11-11
 
 ### Added
@@ -37,6 +43,7 @@ All notable changes to this project are documented here. The format follows [Kee
 
 - First release: one private git repo of markdown context loaded into Claude Code and Codex through a SessionStart hook, with a save skill, `setup`, `install`, `uninstall`, `doctor`, `session-path`, `sync` and `scan` commands, and secret scanning before each commit.
 
+[0.4.0]: https://github.com/LAKBAST/portable-context/releases/tag/v0.4.0
 [0.3.0]: https://github.com/LAKBAST/portable-context/releases/tag/v0.3.0
 [0.2.0]: https://github.com/LAKBAST/portable-context/releases/tag/v0.2.0
 [0.1.0]: https://github.com/LAKBAST/portable-context/tree/eab6387

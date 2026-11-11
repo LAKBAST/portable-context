@@ -41,7 +41,8 @@ Commands:
                  Stop loading a team (the clone is left in place)
   team list      List the teams on this device
   install        Install the hook and skill for Claude Code, Codex and Antigravity
-  uninstall      Remove the hook and skill (never touches the context repo)
+                 (plus a Codex rule that lets pctx sync run without approval)
+  uninstall      Remove the hook, skill and rule (never touches the context repo)
   doctor         Show device, context repo and integration state
   hook [--format antigravity]
                  SessionStart hook: pull and print the context
@@ -219,7 +220,8 @@ function runDoctor() {
       continue;
     }
     const problem = item.problem ? ` (${item.problem})` : '';
-    console.log(`${item.name}: hook ${state(item.hook)}, skill ${state(item.skill)}${problem}`);
+    const rules = 'rules' in item ? `, sync rule ${state(item.rules)}` : '';
+    console.log(`${item.name}: hook ${state(item.hook)}, skill ${state(item.skill)}${rules}${problem}`);
   }
   return 0;
 }

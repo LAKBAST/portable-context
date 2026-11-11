@@ -209,6 +209,28 @@ test('setup installs the Codex hook and skill when CODEX_HOME exists', () => {
   assert.ok(fs.existsSync(path.join(a.home, '.agents', 'skills', 'save-context', 'SKILL.md')));
 });
 
+test('setup installs a Codex rule that allows exactly pctx sync', () => {
+  const sb = makeSandbox();
+  const a = makeDevice(sb, 'laptop');
+  setup(a, sb);
+  const rules = fs.readFileSync(path.join(a.codex, 'rules', 'pctx.rules'), 'utf8');
+  assert.match(rules, /managed-by: portable-context/);
+  assert.match(rules, /decision = "allow"/);
+  assert.match(rules, /pattern = \["node", "[^"]*bin\/pctx\.js", "sync"\]/);
+  assert.match(pctx(a, ['doctor']).stdout, /codex: hook installed, skill installed, sync rule installed/);
+});
+
+test('install refuses a foreign Codex pctx.rules and uninstall keeps it', () => {
+  const sb = makeSandbox();
+  const a = makeDevice(sb, 'laptop');
+  setup(a, sb);
+  const file = path.join(a.codex, 'rules', 'pctx.rules');
+  fs.writeFileSync(file, 'prefix_rule(pattern = ["ls"], decision = "allow")\n');
+  assert.notEqual(pctx(a, ['install']).status, 0);
+  pctx(a, ['uninstall']);
+  assert.equal(fs.readFileSync(file, 'utf8'), 'prefix_rule(pattern = ["ls"], decision = "allow")\n');
+});
+
 // ---------------------------------------------------------------- multi device
 
 test('a second device sees what the first device saved', () => {
@@ -567,6 +589,7 @@ test('uninstall removes only our hook and skill and restores the settings', () =
   assert.ok(!fs.existsSync(path.join(a.claude, 'skills', 'save-context', 'SKILL.md')));
   assert.ok(!fs.existsSync(path.join(a.home, '.agents', 'skills', 'save-context', 'SKILL.md')));
   assert.equal(pctxCommands(path.join(a.codex, 'hooks.json')).length, 0);
+  assert.ok(!fs.existsSync(path.join(a.codex, 'rules')), 'our rule and its empty folder are gone');
   assert.ok(fs.existsSync(path.join(a.context, 'AGENTS.md')), 'context repo is kept');
 });
 

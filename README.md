@@ -60,6 +60,8 @@ git -C "$HOME/.pctx/context" remote set-url origin <new-url>
 
 Codex asks you to trust new hooks. Start Codex and run `/hooks` to review and approve the `pctx` SessionStart hook.
 
+Codex's automatic approval review can also stop the save skill's `pctx sync`, because the notes it pushes may mention internal infrastructure and Codex does not know the remote is yours. `pctx` installs `~/.codex/rules/pctx.rules`, which allows exactly `node "<path>/bin/pctx.js" sync` and leaves every other command to the normal review. Restart Codex after installing so it loads the rule. `pctx` refuses to overwrite a `pctx.rules` it did not create.
+
 ## Antigravity
 
 Antigravity loads hooks and skills from plugins, so `pctx` installs its own plugin at `~/.gemini/config/plugins/portable-context/` (`plugin.json`, `hooks.json` and `skills/<skill-name>/SKILL.md`). It runs `pctx hook --format antigravity` when a conversation starts and loads the project of the first open workspace. `pctx` owns that folder: it refuses to install over a `portable-context` plugin it did not create, and `uninstall` removes only its own files. MCP servers are not managed by `pctx`; add them to `~/.gemini/config/mcp_config.json` yourself.
@@ -114,8 +116,8 @@ Your profile, your other projects and their sessions never go to a team repo. Yo
 | `pctx team add <name> <git-url> [--dir] [--author]` | Clone (and seed if empty) a team repo and add it to the config |
 | `pctx team share <name> [--project] [--cwd]` | Share a project with a team by creating its notes in the team repo |
 | `pctx team remove <name>` / `pctx team list` | Stop loading a team (its clone is kept) / list teams |
-| `pctx install` | Install the hook and skill into Claude Code, Codex and Antigravity |
-| `pctx uninstall` | Remove the hook and skill that pctx installed |
+| `pctx install` | Install the hook and skill into Claude Code, Codex and Antigravity, and the Codex rule for `pctx sync` |
+| `pctx uninstall` | Remove the hook, skill and Codex rule that pctx installed |
 | `pctx doctor` | Check the configuration and installation |
 | `pctx hook [--format antigravity]` | SessionStart hook: reads `{cwd}` (or Antigravity's `workspacePaths`) JSON on stdin, pulls, prints context (as `injectSteps` JSON with `--format antigravity`). Always exits 0 |
 | `pctx session-path [--project] [--cwd] [--private]` | Print a new session file path and create `sessions/` (in the team repo for a shared project; `--private` always uses your context repo) |

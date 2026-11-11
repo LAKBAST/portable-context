@@ -53,6 +53,7 @@ export function targets() {
       skillsDir: join(os.homedir(), '.agents', 'skills'),
       hookExtra: { additionalContextLimit: 9000 },
       skillFrontmatter: [],
+      rulesFile: join(codexHome, 'rules', 'pctx.rules'),
     },
     {
       // Antigravity loads hooks and skills from plugins; pctx owns this whole plugin folder.
@@ -237,6 +238,57 @@ Reply to the user in their language. If the user asked to share the project with
 `;
 }
 
+// Codex's approval reviewer can stop `pctx sync` because the pushed notes look like internal
+// details going to an unknown remote. The remote is the user's own context repo, so the rule
+// allows exactly that command and leaves every other command to the normal review.
+const RULES_MARKER = '# managed-by: portable-context';
+
+function rulesContent() {
+  const cmd = ['node', cliPath(), 'sync'].map((part) => JSON.stringify(part)).join(', ');
+  return `${RULES_MARKER}
+# Lets the save skill run \`pctx sync\` (commit and push of your context repos) without approval.
+prefix_rule(
+    pattern = [${cmd}],
+    decision = "allow",
+    justification = "Syncs the user's own pctx context repos",
+    match = [[${cmd}]],
+)
+`;
+}
+
+function isManagedRules(file) {
+  return readFileSync(file, 'utf8').includes(RULES_MARKER);
+}
+
+function assertRulesWritable(target) {
+  const file = target.rulesFile;
+  if (file && existsSync(file) && !isManagedRules(file)) {
+    throw new Error(`${file} exists and is not managed by pctx; move it away and retry (nothing was changed)`);
+  }
+}
+
+function installRules(target) {
+  if (!target.rulesFile) return;
+  mkdirSync(dirname(target.rulesFile), { recursive: true });
+  writeFileSync(target.rulesFile, rulesContent());
+}
+
+function uninstallRules(target) {
+  const file = target.rulesFile;
+  if (!file || !existsSync(file) || !isManagedRules(file)) return false;
+  rmSync(file);
+  removeIfEmpty(dirname(file));
+  return true;
+}
+
+function rulesStatus(target) {
+  if (!target.rulesFile) return {};
+  if (!existsSync(target.rulesFile)) return { rules: false };
+  return isManagedRules(target.rulesFile)
+    ? { rules: true }
+    : { rules: false, problem: `${target.rulesFile} is not managed by pctx` };
+}
+
 function skillContent(target, name) {
   const frontmatter = [`name: ${name}`, `description: ${SKILL_DESCRIPTION}`, ...target.skillFrontmatter];
   return `---\n${frontmatter.join('\n')}\n---\n\n${skillBody()}`;
@@ -280,10 +332,12 @@ export function install(config) {
     readJson(target.hookFile);
     if (target.plugin) assertPluginOwned(target);
     assertSkillWritable(target, name);
+    assertRulesWritable(target);
   }
   for (const target of available) {
     installHook(target);
     installSkill(target, name);
+    installRules(target);
   }
   return available.map((target) => target.name);
 }
@@ -296,11 +350,12 @@ export function uninstall(config) {
   for (const target of all) {
     const hook = uninstallHook(target);
     const skill = uninstallSkill(target, name);
+    const rules = uninstallRules(target);
     if (target.plugin) {
       removeIfEmpty(target.skillsDir);
       removeIfEmpty(target.pluginDir);
     }
-    if (hook || skill) removed.push(target.name);
+    if (hook || skill || rules) removed.push(target.name);
   }
   return removed;
 }
@@ -329,12 +384,14 @@ export function status(config) {
   return targets().map((target) => {
     const hook = hookStatus(target);
     const skill = skillStatus(target, name);
-    const problem = [hook.problem, skill.problem].filter(Boolean).join('; ');
+    const rules = rulesStatus(target);
+    const problem = [hook.problem, skill.problem, rules.problem].filter(Boolean).join('; ');
     return {
       name: target.name,
       available: existsSync(target.home),
       hook: hook.hook,
       skill: skill.skill,
+      ...('rules' in rules ? { rules: rules.rules } : {}),
       ...(problem ? { problem } : {}),
     };
   });
