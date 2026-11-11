@@ -76,26 +76,59 @@ The agent writes `sessions/YYYY-MM-DD-HHmm-<project>-<device>.md` (path from `pc
 
 Replace the template text in `AGENTS.md` inside your context repo (`~/.pctx/context` by default) with your own preferences, then run `pctx sync`. It is loaded in every session on every device, so keep it short.
 
+## Work with other people (teams)
+
+Your context repo stays private. To share context with other people, add a team: a second git repo that everyone in the team can read and push to. Each person keeps their own private repo, and only what is written into the team repo is shared. Access is whatever your git host grants on that repo; pctx has no server and no accounts.
+
+Create a private, empty repo for the team and give the others access to it. Then, on each device of each person:
+
+```sh
+pctx team add <name> <git-url> --author <your-name>
+```
+
+The first `team add` seeds the repo with `AGENTS.md` (team conventions), `README.md` and `.gitignore`. The clone goes to `~/.pctx/teams/<name>` unless you pass `--dir`. `--author` (saved once for all teams, defaults to the device name) goes into the names of your team sessions so the team knows who wrote them.
+
+Share a project by asking the agent in a session of that project (for example `/save-context comparte este proyecto con el team <name>`). The save skill runs `pctx team share`, writes into the team notes only what the team needs from your private notes, keeps the rest private, saves the session and syncs. By hand, run this inside the project's repo, edit the team notes and run `pctx sync`:
+
+```sh
+pctx team share <name>
+```
+
+When you save a shared project, the skill splits the session: what is useful to the team goes to the team repo, and anything that is not for the team (and anything it is unsure about) goes to a private session in your context repo, using `pctx session-path --private`. It then tells you what went where.
+
+A project is shared when `projects/<project>.md` exists in a team repo. For a shared project:
+
+- The hook also loads the team's `AGENTS.md`, the team notes for the project and the latest team sessions, from everyone.
+- `pctx session-path` returns a path in the team repo, `sessions/YYYY-MM-DD-HHmm-<project>-<author>-<device>.md` (just `<author>` when it equals the device), so the save skill writes there.
+- Notes for that project that were already in your private repo stay private and are shown only to you.
+
+Your profile, your other projects and their sessions never go to a team repo. You can be in several teams, but a project can only belong to one: if two team repos have notes for the same project, the hook loads neither and warns you, and `session-path` refuses until you remove it from one of them.
+
+`pctx sync` and `pctx scan` cover the context repo and every team; with teams, each output line starts with the repo (`context:` or `team <name>:`). `pctx team list` shows your teams and `pctx team remove <name>` stops loading one, leaving its clone in place.
+
 ## Commands
 
 | Command | What it does |
 | --- | --- |
-| `pctx setup <git-url> [--dir] [--device] [--skill-name]` | Clone (and seed if empty) the context repo, save config, install hook and skill |
+| `pctx setup <git-url> [--dir] [--device] [--author] [--skill-name]` | Clone (and seed if empty) the context repo, save config, install hook and skill |
+| `pctx team add <name> <git-url> [--dir] [--author]` | Clone (and seed if empty) a team repo and add it to the config |
+| `pctx team share <name> [--project] [--cwd]` | Share a project with a team by creating its notes in the team repo |
+| `pctx team remove <name>` / `pctx team list` | Stop loading a team (its clone is kept) / list teams |
 | `pctx install` | Install the hook and skill into Claude Code, Codex and Antigravity |
 | `pctx uninstall` | Remove the hook and skill that pctx installed |
 | `pctx doctor` | Check the configuration and installation |
 | `pctx hook [--format antigravity]` | SessionStart hook: reads `{cwd}` (or Antigravity's `workspacePaths`) JSON on stdin, pulls, prints context (as `injectSteps` JSON with `--format antigravity`). Always exits 0 |
-| `pctx session-path [--project] [--cwd]` | Print a new session file path and create `sessions/` |
-| `pctx sync [-m]` | Scan, commit, pull and push. Prints `synced` or `up-to-date` |
+| `pctx session-path [--project] [--cwd] [--private]` | Print a new session file path and create `sessions/` (in the team repo for a shared project; `--private` always uses your context repo) |
+| `pctx sync [-m]` | Scan, commit, pull and push the context repo and every team. Prints `synced` or `up-to-date` |
 | `pctx scan` | Scan pending changes for secrets: `clean` or findings |
 
-`sync` exit codes: 0 success; 2 a possible secret was found (nothing is committed, findings are listed as `file:line (rule)` without the value); 1 pull or push failed (`local-only: ...` on stderr, the commit is kept locally).
+`sync` exit codes: 0 success; 2 a possible secret was found (nothing is committed in that repo, findings are listed as `file:line (rule)` without the value); 1 pull or push failed (`local-only: ...` on stderr, the commit is kept locally). With teams, the worst result of all repos sets the exit code.
 
 Settings files are edited conservatively: other keys and hooks are preserved, invalid JSON is left unchanged and the command fails, the first change creates `<file>.pctx-backup`, and an existing `SKILL.md` that lacks `managed-by: portable-context` is never overwritten.
 
 ## What is synced, and what is not
 
-Synced: the markdown in your context repo. Nothing else leaves your machine. There is no pctx server; only you and your git host see the data. Use a private repo.
+Synced: the markdown in your context repo, and in each team repo you added. Nothing else leaves your machine. There is no pctx server; only you (and, for a team repo, the people with access to it) and your git host see the data. Use private repos.
 
 Never synced: your agents' own settings, credentials, or transcripts. Only what is written into the context repo is pushed.
 

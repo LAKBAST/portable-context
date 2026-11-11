@@ -703,3 +703,188 @@ test('hook --format antigravity prints {} without config and on bad input', () =
   assert.equal(r.status, 0);
   assert.deepEqual(JSON.parse(r.stdout), {});
 });
+
+// ---------------------------------------------------------------- teams
+
+function makeRemote(sandbox, name) {
+  const remote = path.join(sandbox.root, `${name}.git`);
+  git(['init', '--bare', '-b', 'main', remote]);
+  return remote;
+}
+
+function remoteFilesOf(remote) {
+  const r = git(['--git-dir', remote, 'ls-tree', '-r', '--name-only', 'main']);
+  return r.stdout.split('\n').map((s) => s.trim()).filter(Boolean);
+}
+
+function teamAdd(device, name, url, extra = []) {
+  const r = pctx(device, ['team', 'add', name, url, ...extra]);
+  assert.equal(r.status, 0, `team add failed: ${r.stdout}\n${r.stderr}`);
+  return r;
+}
+
+function projectDir(device, name) {
+  const dir = path.join(device.work, name);
+  fs.mkdirSync(dir, { recursive: true });
+  return dir;
+}
+
+// Two people, each with a private context repo, sharing one team repo.
+function twoPeople() {
+  const sb = makeSandbox();
+  const team = makeRemote(sb, 'team');
+  const otherRemote = makeRemote(sb, 'bob-context');
+  const alice = makeDevice(sb, 'alice-laptop');
+  const bob = makeDevice(sb, 'bob-pc');
+  setup(alice, sb, ['--author', 'alice']);
+  const r = pctx(bob, ['setup', otherRemote, '--device', bob.name, '--author', 'bob']);
+  assert.equal(r.status, 0, r.stderr);
+  return { sb, team, alice, bob };
+}
+
+test('team add seeds the team repo from the team template and saves it in the config', () => {
+  const { team, alice } = twoPeople();
+  const r = teamAdd(alice, 'Studio', team);
+  assert.match(r.stdout, /seeded from the team template/);
+  const files = remoteFilesOf(team);
+  for (const f of ['AGENTS.md', 'README.md', '.gitignore']) assert.ok(files.includes(f), files.join(','));
+  const cfg = readJson(path.join(alice.pctxHome, 'config.json'));
+  assert.equal(cfg.teams.length, 1);
+  assert.equal(cfg.teams[0].name, 'studio');
+  assert.equal(cfg.author, 'alice');
+  assert.match(pctx(alice, ['team', 'list']).stdout, /^studio: /m);
+});
+
+test('a teammate sees the shared project and sessions but nothing private', () => {
+  const { team, alice, bob } = twoPeople();
+  teamAdd(alice, 'studio', team);
+  write(path.join(alice.context, 'AGENTS.md'), '# Profile\nALICE-PRIVATE-PROFILE\n');
+  write(path.join(alice.context, 'projects', 'secret-proj.md'), '# secret\nALICE-SECRET-PROJECT\n');
+  write(path.join(alice.context, 'projects', 'shared-app.md'), '# old\nALICE-PRIVATE-NOTES\n');
+
+  const share = pctx(alice, ['team', 'share', 'studio', '--project', 'shared-app']);
+  assert.equal(share.status, 0, share.stderr);
+  assert.match(share.stdout, /stay private/);
+  const teamDir = path.join(alice.pctxHome, 'teams', 'studio');
+  write(path.join(teamDir, 'projects', 'shared-app.md'), '# shared-app\nTEAM-NOTES\n');
+  const session = newSession(alice, 'shared-app', '# Session\nALICE-SESSION\n');
+  assert.equal(real(path.dirname(session)), real(path.join(teamDir, 'sessions')));
+  assert.match(path.basename(session), /-shared-app-alice-alice-laptop\.md$/);
+
+  const s = pctx(alice, ['sync']);
+  assert.equal(s.status, 0, s.stderr);
+  assert.match(s.stdout, /^context: synced/m);
+  assert.match(s.stdout, /^team studio: synced/m);
+
+  const teamFiles = remoteFilesOf(team).join('\n');
+  assert.ok(!teamFiles.includes('secret-proj'), teamFiles);
+  assert.ok(teamFiles.includes('sessions/' + path.basename(session)), teamFiles);
+
+  teamAdd(bob, 'studio', team);
+  const h = hook(bob, projectDir(bob, 'shared-app'));
+  assert.equal(h.status, 0);
+  assert.ok(h.stdout.includes('## Current project: shared-app (shared in team studio)'), h.stdout);
+  assert.ok(h.stdout.includes('TEAM-NOTES'));
+  assert.ok(h.stdout.includes('## Team studio'));
+  assert.ok(h.stdout.includes(path.basename(session)), 'bob should see the session alice saved');
+  for (const secret of ['ALICE-PRIVATE-PROFILE', 'ALICE-SECRET-PROJECT', 'ALICE-PRIVATE-NOTES', 'secret-proj']) {
+    assert.ok(!h.stdout.includes(secret), `bob must not see ${secret}`);
+  }
+  assert.ok(!h.stdout.includes('WARNING'), h.stdout);
+
+  const own = hook(alice, projectDir(alice, 'shared-app'));
+  assert.ok(own.stdout.includes('## Your private notes for shared-app'));
+  assert.ok(own.stdout.includes('ALICE-PRIVATE-NOTES'));
+});
+
+test('projects that are not shared keep sessions in the personal repo', () => {
+  const { team, alice } = twoPeople();
+  teamAdd(alice, 'studio', team);
+  const r = pctx(alice, ['session-path', '--project', 'solo']);
+  assert.equal(real(path.dirname(r.stdout.trim())), real(path.join(alice.context, 'sessions')));
+  assert.match(path.basename(r.stdout.trim()), /-solo-alice-laptop\.md$/);
+  const h = hook(alice, projectDir(alice, 'solo'));
+  assert.ok(h.stdout.includes('## Current project: solo\n'), h.stdout);
+});
+
+test('a project shared in two teams loads neither and session-path refuses', () => {
+  const { sb, team, alice } = twoPeople();
+  const team2 = makeRemote(sb, 'team2');
+  teamAdd(alice, 'one', team);
+  teamAdd(alice, 'two', team2);
+  assert.equal(pctx(alice, ['team', 'share', 'one', '--project', 'app']).status, 0);
+  const again = pctx(alice, ['team', 'share', 'two', '--project', 'app']);
+  assert.equal(again.status, 1);
+  assert.match(again.stderr, /already shared in team one/);
+
+  write(path.join(alice.pctxHome, 'teams', 'two', 'projects', 'app.md'), '# app\nTWO\n');
+  const h = hook(alice, projectDir(alice, 'app'));
+  assert.equal(h.status, 0);
+  assert.match(h.stdout, /WARNING: Project app has notes in more than one team \(one, two\)/);
+  assert.ok(!h.stdout.includes('shared in team'));
+  assert.equal(pctx(alice, ['session-path', '--project', 'app']).status, 1);
+});
+
+test('sync blocks a secret in a team repo and exits 2', () => {
+  const { team, alice } = twoPeople();
+  teamAdd(alice, 'studio', team);
+  const before = remoteFilesOf(team).length;
+  write(path.join(alice.pctxHome, 'teams', 'studio', 'projects', 'x.md'), `token ${fakeGithubToken()}\n`);
+  const s = pctx(alice, ['sync']);
+  assert.equal(s.status, 2);
+  assert.match(s.stderr, /^team studio: blocked/m);
+  assert.ok(!s.stderr.includes(fakeGithubToken()));
+  assert.equal(remoteFilesOf(team).length, before);
+});
+
+test('an unreachable team repo warns in the hook but still loads the context', () => {
+  const { team, alice } = twoPeople();
+  teamAdd(alice, 'studio', team);
+  fs.renameSync(team, team + '.off');
+  const h = hook(alice, projectDir(alice, 'any'));
+  assert.equal(h.status, 0);
+  assert.match(h.stdout, /WARNING: team studio may be out of date/);
+  assert.ok(h.stdout.includes('## Profile'));
+});
+
+test('setup again keeps the teams and author; team remove drops a team', () => {
+  const { sb, team, alice } = twoPeople();
+  teamAdd(alice, 'studio', team);
+  setup(alice, sb);
+  const cfg = readJson(path.join(alice.pctxHome, 'config.json'));
+  assert.equal(cfg.teams.length, 1);
+  assert.equal(cfg.author, 'alice');
+  assert.match(pctx(alice, ['doctor']).stdout, /Team studio:/);
+  assert.equal(pctx(alice, ['team', 'remove', 'studio']).status, 0);
+  assert.deepEqual(readJson(path.join(alice.pctxHome, 'config.json')).teams, []);
+  assert.ok(fs.existsSync(path.join(alice.pctxHome, 'teams', 'studio')), 'the clone is left in place');
+});
+
+test('session-path --private uses the personal repo for a shared project', () => {
+  const { team, alice } = twoPeople();
+  teamAdd(alice, 'studio', team);
+  assert.equal(pctx(alice, ['team', 'share', 'studio', '--project', 'app']).status, 0);
+  const r = pctx(alice, ['session-path', '--project', 'app', '--private']);
+  assert.equal(r.status, 0, r.stderr);
+  assert.equal(real(path.dirname(r.stdout.trim())), real(path.join(alice.context, 'sessions')));
+  assert.match(path.basename(r.stdout.trim()), /-app-alice-laptop\.md$/);
+});
+
+test('the save skill covers sharing a project and splitting private notes', () => {
+  const sb = makeSandbox();
+  const a = makeDevice(sb, 'laptop');
+  setup(a, sb);
+  const skill = fs.readFileSync(path.join(a.claude, 'skills', 'save-context', 'SKILL.md'), 'utf8');
+  assert.match(skill, /## Share a project/);
+  assert.match(skill, /team share <team> --cwd \./);
+  assert.match(skill, /session-path --cwd \. --private/);
+  assert.match(skill, /^description: .*share the project with a team/m);
+});
+
+test('team add refuses a different URL for an existing team name', () => {
+  const { sb, team, alice } = twoPeople();
+  teamAdd(alice, 'studio', team);
+  const r = pctx(alice, ['team', 'add', 'studio', makeRemote(sb, 'other')]);
+  assert.equal(r.status, 1);
+  assert.match(r.stderr, /already points at/);
+});

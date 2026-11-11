@@ -6,7 +6,11 @@ import { fileURLToPath } from 'node:url';
 import { scanDiff } from './secrets.js';
 
 const TEMPLATE_DIR = fileURLToPath(new URL('../template/', import.meta.url));
+export const TEAM_TEMPLATE_DIR = fileURLToPath(new URL('../template-team/', import.meta.url));
 const PULL_TIMEOUT = 15_000;
+// The SessionStart hook times out at 30s; every pull and push in the hook must end before this.
+const HOOK_BUDGET = 25_000;
+const MIN_REFRESH_TIME = 2_000;
 // Pull plus push must stay under the 30s SessionStart hook timeout.
 const REFRESH_PUSH_TIMEOUT = 10_000;
 const SYNC_PUSH_TIMEOUT = 60_000;
@@ -77,16 +81,16 @@ function identityArgs(dir) {
   return args;
 }
 
-function copyTemplate(dir) {
-  for (const entry of readdirSync(TEMPLATE_DIR)) {
+function copyTemplate(dir, templateDir) {
+  for (const entry of readdirSync(templateDir)) {
     // npm can drop files named .gitignore from packages, hence the rename.
     const target = join(dir, entry === 'gitignore' ? '.gitignore' : entry);
-    if (!existsSync(target)) cpSync(join(TEMPLATE_DIR, entry), target, { recursive: true });
+    if (!existsSync(target)) cpSync(join(templateDir, entry), target, { recursive: true });
   }
 }
 
-function seedEmptyRepo(dir) {
-  copyTemplate(dir);
+function seedEmptyRepo(dir, templateDir) {
+  copyTemplate(dir, templateDir);
   const steps = [
     ['checkout', '-q', '-B', 'main'],
     ['add', '-A'],
@@ -99,7 +103,7 @@ function seedEmptyRepo(dir) {
   }
 }
 
-export function setupContextRepo(url, dir) {
+export function setupContextRepo(url, dir, templateDir = TEMPLATE_DIR) {
   const target = resolve(dir);
   if (existsSync(join(target, '.git'))) {
     const origin = git(target, ['config', '--get', 'remote.origin.url']).stdout.trim();
@@ -112,7 +116,7 @@ export function setupContextRepo(url, dir) {
     if (!clone.ok) throw new Error(`Could not clone ${url}: ${firstLine(clone.stderr)}`);
   }
   if (git(target, ['rev-parse', '--verify', '-q', 'HEAD']).ok) return { seeded: false };
-  seedEmptyRepo(target);
+  seedEmptyRepo(target, templateDir);
   return { seeded: true };
 }
 
@@ -124,10 +128,10 @@ function stashCount(dir) {
   return git(dir, ['stash', 'list']).stdout.split('\n').filter(Boolean).length;
 }
 
-function pullRebase(dir) {
+function pullRebase(dir, timeout = PULL_TIMEOUT) {
   const stashed = stashCount(dir);
   // Replaying local commits needs a committer identity too.
-  const pull = git(dir, [...identityArgs(dir), 'pull', '-q', '--rebase', '--autostash'], { timeout: PULL_TIMEOUT });
+  const pull = git(dir, [...identityArgs(dir), 'pull', '-q', '--rebase', '--autostash'], { timeout });
   if (pull.ok) {
     // git exits 0 when the autostash cannot be reapplied, which would hide the user's edits.
     if (stashCount(dir) > stashed) {
@@ -153,15 +157,67 @@ function push(dir, timeout) {
   return { ok: false, message: `Could not push: ${firstLine(result.stderr) || 'git push failed'}` };
 }
 
-export function refresh(dir) {
-  const pulled = pullRebase(dir);
+// `deadline` (a Date.now() value) shortens the git timeouts so several repos fit in one hook run.
+export function refresh(dir, deadline = Infinity) {
+  const left = () => deadline - Date.now();
+  if (left() < MIN_REFRESH_TIME) return { ok: false, message: 'Not refreshed: no time left in the session hook' };
+  const pulled = pullRebase(dir, Math.min(PULL_TIMEOUT, left()));
   if (!pulled.ok) return { ok: false, message: pulled.message };
   // Retries saves that could not be pushed earlier, for example while offline.
   if (aheadCount(dir) > 0) {
-    const pushed = push(dir, REFRESH_PUSH_TIMEOUT);
+    if (left() < MIN_REFRESH_TIME) return { ok: false, message: 'Pending saves not pushed: no time left in the session hook' };
+    const pushed = push(dir, Math.min(REFRESH_PUSH_TIMEOUT, left()));
     if (!pushed.ok) return pushed;
   }
   return { ok: true };
+}
+
+export function hookDeadline(start = Date.now()) {
+  return start + HOOK_BUDGET;
+}
+
+// ---------------------------------------------------------------- teams
+
+export function teamList(config) {
+  return Array.isArray(config?.teams) ? config.teams : [];
+}
+
+export function defaultTeamDir(name) {
+  return join(configDir(), 'teams', slug(name));
+}
+
+export function findTeam(config, name) {
+  return teamList(config).find((team) => team.name === slug(name)) ?? null;
+}
+
+function teamProjectFile(team, project) {
+  return join(team.dir, 'projects', `${project}.md`);
+}
+
+// A project is shared when a team repo has notes for it. Two teams with the same project
+// would mix their context, so that case loads neither and is reported instead.
+export function resolveProjectTeam(config, project) {
+  if (!project) return { team: null };
+  const owners = teamList(config).filter((team) => existsSync(teamProjectFile(team, project)));
+  if (owners.length > 1) {
+    const names = owners.map((team) => team.name).join(', ');
+    return {
+      team: null,
+      conflict: `Project ${project} has notes in more than one team (${names}); keep projects/${project}.md in only one team repo`,
+    };
+  }
+  return { team: owners[0] ?? null };
+}
+
+export function shareProject(config, team, project) {
+  const { team: owner, conflict } = resolveProjectTeam(config, project);
+  if (conflict) throw new Error(conflict);
+  if (owner && owner.name !== team.name) throw new Error(`Project ${project} is already shared in team ${owner.name}`);
+  const file = teamProjectFile(team, project);
+  if (existsSync(file)) return { file, created: false };
+  mkdirSync(dirname(file), { recursive: true });
+  writeFileSync(file, `# ${project}\n\nShared notes for the team. Keep only the current state of the project.\n`);
+  return { file, created: true };
 }
 
 function remoteName(url) {
@@ -210,33 +266,75 @@ function projectSection(dir, project) {
   return [`## Current project: ${project}\n\n${body}`];
 }
 
-export function buildContext(config, cwd, syncResult) {
+function teamProjectSections(dir, team, project) {
+  const file = teamProjectFile(team, project);
+  const text = readIfExists(file) ?? '';
+  const sections = [];
+  const teamProfile = readIfExists(join(team.dir, 'AGENTS.md'));
+  if (teamProfile) sections.push(`## Team ${team.name}\n\n${truncate(teamProfile, PROFILE_MAX, join(team.dir, 'AGENTS.md'))}`);
+  sections.push(
+    `## Current project: ${project} (shared in team ${team.name})\n\n` +
+      `Team repo: ${team.dir}. Everyone in the team reads its notes and sessions; save sessions of this project there.\n\n` +
+      (text ? truncate(text, PROJECT_MAX, file) : `No notes yet (${file}).`),
+  );
+  // Notes kept in the personal repo before the project was shared stay private.
+  const privateFile = join(dir, 'projects', `${project}.md`);
+  const privateText = readIfExists(privateFile);
+  if (privateText) sections.push(`## Your private notes for ${project}\n\n${truncate(privateText, PROJECT_MAX, privateFile)}`);
+  return sections;
+}
+
+function recentSessions(dir, project) {
+  if (!project) return [];
+  return markdownFiles(join(dir, 'sessions')).filter((name) => name.includes(`-${project}-`)).slice(-RECENT_SESSIONS);
+}
+
+function warningLine(label, result) {
+  if (!result || result.ok) return [];
+  return [`WARNING: ${label} may be out of date (${result.message ?? 'sync failed'}). Tell the user.`];
+}
+
+// `teamResults` maps a team name to the result of refreshing that team repo.
+export function buildContext(config, cwd, syncResult, teamResults = {}) {
   const dir = config.contextDir;
+  const teams = teamList(config);
   const project = detectProject(cwd);
+  const { team, conflict } = resolveProjectTeam(config, project);
   const others = markdownFiles(join(dir, 'projects')).filter((name) => name !== `${project}.md`);
-  const sessions = project
-    ? markdownFiles(join(dir, 'sessions')).filter((name) => name.includes(`-${project}-`)).slice(-RECENT_SESSIONS)
-    : [];
-  const warning =
-    syncResult && !syncResult.ok
-      ? [`WARNING: the context may be out of date (${syncResult.message ?? 'sync failed'}). Tell the user.`]
-      : [];
+  for (const t of teams) {
+    for (const name of markdownFiles(join(t.dir, 'projects'))) {
+      if (name !== `${project}.md`) others.push(`${name} (team ${t.name})`);
+    }
+  }
+  const teamHeader = teams.length ? [`Team repos: ${teams.map((t) => `${t.name} (${t.dir})`).join(', ')}`] : [];
+  const teamSessions = team ? recentSessions(team.dir, project) : [];
   return [
     '# Portable context',
     `Context repo: ${dir}`,
-    ...warning,
+    ...teamHeader,
+    ...warningLine('the context', syncResult),
+    ...teams.flatMap((t) => warningLine(`team ${t.name}`, teamResults[t.name])),
+    ...(conflict ? [`WARNING: ${conflict}. Tell the user.`] : []),
     ...profileSection(dir),
-    ...projectSection(dir, project),
+    ...(team ? teamProjectSections(dir, team, project) : projectSection(dir, project)),
     ...listSection('Other projects', others),
-    ...listSection('Recent sessions for this project', sessions),
+    ...listSection('Recent sessions for this project', recentSessions(dir, project)),
+    ...listSection(`Recent team sessions for this project (${join(team?.dir ?? '', 'sessions')})`, teamSessions),
   ].join('\n\n');
 }
 
-export function sessionPath(config, project, now = new Date()) {
+// Sessions of a shared project go to its team repo and carry the author, so the team knows who wrote them.
+export function sessionPath(config, project, now = new Date(), team = null) {
   const pad = (n) => String(n).padStart(2, '0');
   const date = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}`;
   const time = `${pad(now.getHours())}${pad(now.getMinutes())}`;
-  return join(config.contextDir, 'sessions', `${date}-${time}-${slug(project)}-${slug(config.device)}.md`);
+  const device = slug(config.device);
+  if (team) {
+    const author = slug(config.author ?? device);
+    const who = author === device ? author : `${author}-${device}`;
+    return join(team.dir, 'sessions', `${date}-${time}-${slug(project)}-${who}.md`);
+  }
+  return join(config.contextDir, 'sessions', `${date}-${time}-${slug(project)}-${device}.md`);
 }
 
 export function stagedFindings(dir) {
@@ -259,8 +357,7 @@ function commitStaged(dir, message) {
   return { committed: false, error: firstLine(commit.stderr) || firstLine(commit.stdout) || 'git commit failed' };
 }
 
-export function sync(config, message) {
-  const dir = config.contextDir;
+export function sync(config, message, dir = config.contextDir) {
   let findings;
   try {
     findings = stagedFindings(dir);

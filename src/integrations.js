@@ -20,7 +20,7 @@ const SKILL_MARKER = '<!-- managed-by: portable-context -->';
 const DEFAULT_SKILL = 'save-context';
 const PLUGIN_NAME = 'portable-context';
 const SKILL_DESCRIPTION =
-  'Save this session\'s decisions and state to the user\'s portable context repo. Use only when the user explicitly asks to save the context or session (for example "guarda el contexto" or "save context").';
+  'Save this session\'s decisions and state to the user\'s portable context repo and team repos, or share a project with a team. Use only when the user explicitly asks to save the context or session, or to share the project with a team (for example "guarda el contexto", "save context" or "comparte este proyecto con el team").';
 
 function cliPath() {
   return fileURLToPath(new URL('../bin/pctx.js', import.meta.url)).replaceAll('\\', '/');
@@ -215,16 +215,25 @@ function skillBody() {
 
 # Save context
 
-Follow these steps in order. Reply to the user in their language.
+Reply to the user in their language. If the user asked to share the project with a team, do "Share a project" first and then "Save"; otherwise do only "Save".
 
-1. Run \`${cli} session-path --cwd .\` (add \`--project <name>\` if the user names another project) and use the printed path.
+## Share a project
+
+1. Run \`${cli} team list\`. Use the team the user named; if they named none and there is exactly one, use it; otherwise ask which one.
+2. Run \`${cli} team share <team> --cwd .\` and note the team notes file it prints.
+3. If the user has private notes for this project (\`projects/<project>.md\` in their context repo), split them: write into the team notes file only what the team needs (current state, decisions, pending work, conventions), and keep in the private file only what is not for the team. Old private sessions stay where they are; do not copy them.
+
+## Save
+
+1. Run \`${cli} session-path --cwd .\` (add \`--project <name>\` if the user names another project) and use the printed path. For a project shared with a team, the path is inside that team's repo.
 2. Write a short summary at that path: what was decided and why, what is pending, what was tried and failed. Leave out logs, tool output, and anything readable from the code.
-3. Update \`projects/<project>.md\` in the same repo so it reflects only the current state, removing what is no longer true. Add a file under \`decisions/\` only for long-term decisions.
-4. Never write credentials or personal data about others; refer to people by name.
-5. Run \`${cli} sync\`.
+3. Update \`projects/<project>.md\` in the same repo as that path so it reflects only the current state, removing what is no longer true. Add a file under \`decisions/\` only for long-term decisions.
+4. A team repo is read by everyone in the team: keep it to the shared project. If the session also produced things that are not for the team (opinions about people or clients, the user's own pending tasks, anything they asked to keep private), run \`${cli} session-path --cwd . --private\` and write only those there. When unsure whether something is for the team, put it in the private file. If there is nothing private, write no private file.
+5. Never write credentials or personal data about others; refer to people by name.
+6. Run \`${cli} sync\`. It syncs the context repo and every team repo; with teams, each line starts with the repo it is about.
    - \`blocked\`: remove the secret at the listed file:line, or ask the user if it is a false positive. Never bypass the check.
-   - \`local-only\`: the save is committed on this device but has not reached other devices. Tell the user.
-6. Tell the user in one or two lines what was saved and whether it reached the remote.
+   - \`local-only\`: the save is committed on this device but has not reached the remote. Tell the user.
+7. Tell the user in one or two lines what went where (for example "saved to team lakbast; 2 private notes in your context repo") and whether it reached the remote.
 `;
 }
 
