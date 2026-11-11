@@ -1,6 +1,6 @@
 # pctx (portable-context)
 
-Your agent memories do not travel. What Claude Code learned on your laptop is not available to Codex on your desktop, or to a fresh terminal on another machine. `pctx` keeps one private git repository of markdown context and loads it into every Claude Code and Codex session, on every device.
+Your agent memories do not travel. What Claude Code learned on your laptop is not available to Codex on your desktop, or to a fresh terminal on another machine. `pctx` keeps one private git repository of markdown context and loads it into every Claude Code, Codex and Antigravity session, on every device.
 
 ## How it works
 
@@ -40,7 +40,7 @@ gh repo create <you>/context --private
 pctx setup https://github.com/<you>/context.git
 ```
 
-If the repo is empty, `setup` seeds it with `AGENTS.md`, `README.md` and `.gitignore` and pushes to `main`. It then saves `~/.pctx/config.json` and installs the hook and skill for Claude Code and Codex. Only tools whose home directory exists (`CLAUDE_CONFIG_DIR` or `~/.claude`; `CODEX_HOME` or `~/.codex`) are configured.
+If the repo is empty, `setup` seeds it with `AGENTS.md`, `README.md` and `.gitignore` and pushes to `main`. It then saves `~/.pctx/config.json` and installs the hook and skill for Claude Code, Codex and Antigravity. Only tools whose home directory exists (`CLAUDE_CONFIG_DIR` or `~/.claude`; `CODEX_HOME` or `~/.codex`; `ANTIGRAVITY_CONFIG_DIR` or `~/.gemini/config`) are configured.
 
 Options: `--dir <path>` (where to clone), `--device <name>` (appears in session file names), `--skill-name <name>` (default `save-context`).
 
@@ -60,10 +60,15 @@ git -C "$HOME/.pctx/context" remote set-url origin <new-url>
 
 Codex asks you to trust new hooks. Start Codex and run `/hooks` to review and approve the `pctx` SessionStart hook.
 
+## Antigravity
+
+Antigravity loads hooks and skills from plugins, so `pctx` installs its own plugin at `~/.gemini/config/plugins/portable-context/` (`plugin.json`, `hooks.json` and `skills/<skill-name>/SKILL.md`). It runs `pctx hook --format antigravity` when a conversation starts and loads the project of the first open workspace. `pctx` owns that folder: it refuses to install over a `portable-context` plugin it did not create, and `uninstall` removes only its own files. MCP servers are not managed by `pctx`; add them to `~/.gemini/config/mcp_config.json` yourself.
+
 ## Save a session
 
 - Claude Code: `/save-context`
 - Codex: `$save-context`
+- Antigravity: ask the agent to save the context; it picks the skill by its description.
 
 The agent writes `sessions/YYYY-MM-DD-HHmm-<project>-<device>.md` (path from `pctx session-path`) and runs `pctx sync`.
 
@@ -76,10 +81,10 @@ Replace the template text in `AGENTS.md` inside your context repo (`~/.pctx/cont
 | Command | What it does |
 | --- | --- |
 | `pctx setup <git-url> [--dir] [--device] [--skill-name]` | Clone (and seed if empty) the context repo, save config, install hook and skill |
-| `pctx install` | Install the hook and skill into Claude Code and Codex |
+| `pctx install` | Install the hook and skill into Claude Code, Codex and Antigravity |
 | `pctx uninstall` | Remove the hook and skill that pctx installed |
 | `pctx doctor` | Check the configuration and installation |
-| `pctx hook` | SessionStart hook: reads `{cwd}` JSON on stdin, pulls, prints context. Always exits 0 |
+| `pctx hook [--format antigravity]` | SessionStart hook: reads `{cwd}` (or Antigravity's `workspacePaths`) JSON on stdin, pulls, prints context (as `injectSteps` JSON with `--format antigravity`). Always exits 0 |
 | `pctx session-path [--project] [--cwd]` | Print a new session file path and create `sessions/` |
 | `pctx sync [-m]` | Scan, commit, pull and push. Prints `synced` or `up-to-date` |
 | `pctx scan` | Scan pending changes for secrets: `clean` or findings |

@@ -1,7 +1,7 @@
 {
   "name": "@lakbast/portable-context",
-  "version": "0.1.0",
-  "description": "One private git repo of markdown context shared by Claude Code and Codex across devices.",
+  "version": "0.2.0",
+  "description": "One private git repo of markdown context shared by Claude Code, Codex and Antigravity across devices.",
   "type": "module",
   "private": true,
   "license": "MIT",

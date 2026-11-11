@@ -48,7 +48,7 @@ function makeSandbox() {
   return { root, remote };
 }
 
-function makeDevice(sandbox, name, { claude = true, codex = true } = {}) {
+function makeDevice(sandbox, name, { claude = true, codex = true, antigravity = false } = {}) {
   const home = path.join(sandbox.root, name, 'home');
   const d = {
     name,
@@ -56,12 +56,15 @@ function makeDevice(sandbox, name, { claude = true, codex = true } = {}) {
     pctxHome: path.join(sandbox.root, name, 'pctx'),
     claude: path.join(home, '.claude'),
     codex: path.join(home, '.codex'),
+    antigravity: path.join(home, '.gemini', 'config'),
     work: path.join(sandbox.root, name, 'work'),
   };
+  d.plugin = path.join(d.antigravity, 'plugins', 'portable-context');
   fs.mkdirSync(home, { recursive: true });
   fs.mkdirSync(d.work, { recursive: true });
   if (claude) fs.mkdirSync(d.claude, { recursive: true });
   if (codex) fs.mkdirSync(d.codex, { recursive: true });
+  if (antigravity) fs.mkdirSync(d.antigravity, { recursive: true });
   d.context = path.join(d.pctxHome, 'context');
   d.env = {
     ...baseEnv(),
@@ -70,6 +73,7 @@ function makeDevice(sandbox, name, { claude = true, codex = true } = {}) {
     PCTX_HOME: d.pctxHome,
     CLAUDE_CONFIG_DIR: d.claude,
     CODEX_HOME: d.codex,
+    ANTIGRAVITY_CONFIG_DIR: d.antigravity,
   };
   return d;
 }
@@ -593,4 +597,109 @@ test('session-path prints a dated file name and creates sessions/', () => {
   const p = r.stdout.trim();
   assert.match(path.basename(p), /^\d{4}-\d{2}-\d{2}-\d{4}-myproj-laptop\.md$/);
   assert.equal(real(path.dirname(p)), real(path.join(a.context, 'sessions')));
+});
+
+// ---------------------------------------------------------------- antigravity
+
+function antigravityCommands(device) {
+  const file = path.join(device.plugin, 'hooks.json');
+  if (!fs.existsSync(file)) return [];
+  return Object.values(readJson(file))
+    .flatMap((spec) => spec.SessionStart ?? [])
+    .map((h) => h.command)
+    .filter((c) => typeof c === 'string' && c.includes('pctx.js'));
+}
+
+test('setup skips Antigravity when its config dir does not exist', () => {
+  const sb = makeSandbox();
+  const a = makeDevice(sb, 'laptop');
+  const r = setup(a, sb);
+  assert.ok(!r.stdout.includes('antigravity'), r.stdout);
+  assert.ok(!fs.existsSync(a.antigravity));
+});
+
+test('setup installs the Antigravity plugin with hook and skill', () => {
+  const sb = makeSandbox();
+  const a = makeDevice(sb, 'laptop', { antigravity: true });
+  const r = setup(a, sb, ['--skill-name', 'guardar']);
+  assert.ok(r.stdout.includes('antigravity'), r.stdout);
+  assert.equal(readJson(path.join(a.plugin, 'plugin.json')).name, 'portable-context');
+  const commands = antigravityCommands(a);
+  assert.equal(commands.length, 1);
+  assert.ok(commands[0].endsWith('hook --format antigravity'), commands[0]);
+  const skill = fs.readFileSync(path.join(a.plugin, 'skills', 'guardar', 'SKILL.md'), 'utf8');
+  assert.ok(skill.startsWith('---\nname: guardar\n'));
+  assert.ok(skill.includes('managed-by: portable-context'));
+});
+
+test('install is idempotent for Antigravity', () => {
+  const sb = makeSandbox();
+  const a = makeDevice(sb, 'laptop', { antigravity: true });
+  setup(a, sb);
+  const file = path.join(a.plugin, 'hooks.json');
+  const before = fs.readFileSync(file, 'utf8');
+  assert.equal(pctx(a, ['install']).status, 0);
+  assert.equal(fs.readFileSync(file, 'utf8'), before);
+  assert.equal(antigravityCommands(a).length, 1);
+});
+
+test('install refuses a foreign portable-context plugin folder and changes nothing', () => {
+  const sb = makeSandbox();
+  const a = makeDevice(sb, 'laptop', { antigravity: true });
+  write(path.join(a.plugin, 'plugin.json'), '{"name":"portable-context"}');
+  const r = pctx(a, ['setup', sb.remote, '--device', 'laptop']);
+  assert.notEqual(r.status, 0);
+  assert.match(r.stderr, /not managed by pctx/);
+  assert.ok(!fs.existsSync(path.join(a.plugin, 'hooks.json')));
+  assert.ok(!fs.existsSync(path.join(a.claude, 'settings.json')), 'other targets untouched');
+});
+
+test('uninstall removes the Antigravity plugin but keeps files the user added', () => {
+  const sb = makeSandbox();
+  const a = makeDevice(sb, 'laptop', { antigravity: true });
+  setup(a, sb);
+  const r = pctx(a, ['uninstall']);
+  assert.equal(r.status, 0, r.stderr);
+  assert.ok(r.stdout.includes('antigravity'), r.stdout);
+  assert.ok(!fs.existsSync(a.plugin));
+
+  setup(a, sb);
+  write(path.join(a.plugin, 'rules', 'mine.md'), 'keep me');
+  pctx(a, ['uninstall']);
+  assert.ok(!fs.existsSync(path.join(a.plugin, 'hooks.json')));
+  assert.ok(!fs.existsSync(path.join(a.plugin, 'skills')));
+  assert.ok(fs.existsSync(path.join(a.plugin, 'rules', 'mine.md')));
+});
+
+test('doctor reports the Antigravity integration', () => {
+  const sb = makeSandbox();
+  const a = makeDevice(sb, 'laptop', { antigravity: true });
+  setup(a, sb);
+  const r = pctx(a, ['doctor']);
+  assert.match(r.stdout, /antigravity: hook installed, skill installed/);
+});
+
+test('hook --format antigravity prints injectSteps for the first workspace', () => {
+  const sb = makeSandbox();
+  const a = makeDevice(sb, 'laptop', { antigravity: true });
+  setup(a, sb);
+  const work = path.join(a.work, 'my-app');
+  fs.mkdirSync(work, { recursive: true });
+  const r = pctx(a, ['hook', '--format', 'antigravity'], {
+    input: JSON.stringify({ conversationId: 'x', workspacePaths: [work] }),
+    cwd: a.plugin,
+  });
+  assert.equal(r.status, 0);
+  const out = JSON.parse(r.stdout);
+  const text = out.injectSteps[0].systemMessage.systemMessage;
+  assert.ok(text.includes('# Portable context'));
+  assert.ok(text.includes('Current project: my-app'), text);
+});
+
+test('hook --format antigravity prints {} without config and on bad input', () => {
+  const sb = makeSandbox();
+  const a = makeDevice(sb, 'laptop', { antigravity: true });
+  const r = pctx(a, ['hook', '--format', 'antigravity'], { input: 'not json' });
+  assert.equal(r.status, 0);
+  assert.deepEqual(JSON.parse(r.stdout), {});
 });

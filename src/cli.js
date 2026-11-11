@@ -1,4 +1,5 @@
 import { mkdirSync, readFileSync } from 'node:fs';
+import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { parseArgs } from 'node:util';
 import {
@@ -25,10 +26,11 @@ const USAGE = `Usage: pctx <command> [options]
 Commands:
   setup <git-url> [--dir <path>] [--device <name>] [--skill-name <name>]
                  Clone or seed the context repo and install the integrations
-  install        Install the hook and skill for Claude Code and Codex
+  install        Install the hook and skill for Claude Code, Codex and Antigravity
   uninstall      Remove the hook and skill (never touches the context repo)
   doctor         Show device, context repo and integration state
-  hook           SessionStart hook: pull and print the context
+  hook [--format antigravity]
+                 SessionStart hook: pull and print the context
   session-path [--project <name>] [--cwd <path>]
                  Print the path for a new session summary
   sync [-m <message>]
@@ -57,11 +59,12 @@ function formatFindings(findings) {
 
 function printInstalled(names) {
   if (!names.length) {
-    console.log('Neither Claude Code nor Codex was found on this device; no hook or skill installed.');
+    console.log('No Claude Code, Codex or Antigravity was found on this device; no hook or skill installed.');
     return;
   }
   console.log(`Installed for: ${names.join(', ')}`);
   if (names.includes('codex')) console.log('Codex: approve the new hook with /hooks in Codex.');
+  if (names.includes('antigravity')) console.log('Antigravity: the portable-context plugin loads in new conversations.');
 }
 
 function runSetup(positionals, values) {
@@ -127,17 +130,39 @@ function readHookInput() {
   }
 }
 
+function hookWorkDir(input, antigravity) {
+  if (typeof input.cwd === 'string' && input.cwd) return input.cwd;
+  // Antigravity sends the open workspaces and runs the hook inside the plugin folder.
+  const [workspace] = Array.isArray(input.workspacePaths) ? input.workspacePaths : [];
+  if (typeof workspace === 'string' && workspace) return workspace;
+  return antigravity ? homedir() : process.cwd();
+}
+
+// Antigravity reads a JSON object from stdout and shows injected steps to the model.
+function printHookOutput(text, antigravity) {
+  if (!antigravity) {
+    if (text) console.log(text);
+    return;
+  }
+  const steps = text ? [{ systemMessage: { systemMessage: text } }] : [];
+  console.log(JSON.stringify(steps.length ? { injectSteps: steps } : {}));
+}
+
 // A session must start normally even when the context cannot be loaded, so this always returns 0.
-function runHook() {
+function runHook(args) {
+  const formatAt = args.indexOf('--format');
+  const antigravity = formatAt !== -1 && args[formatAt + 1] === 'antigravity';
+  let text = '';
   try {
     const config = loadConfig();
-    if (!config) return 0;
-    const { cwd } = readHookInput();
-    const workDir = typeof cwd === 'string' && cwd ? cwd : process.cwd();
-    console.log(buildContext(config, workDir, refresh(config.contextDir)));
+    if (config) {
+      const workDir = hookWorkDir(readHookInput(), antigravity);
+      text = buildContext(config, workDir, refresh(config.contextDir));
+    }
   } catch (err) {
-    console.log(`Portable context unavailable: ${String(err?.message ?? err).split(/\r?\n/)[0]}`);
+    text = `Portable context unavailable: ${String(err?.message ?? err).split(/\r?\n/)[0]}`;
   }
+  printHookOutput(text, antigravity);
   return 0;
 }
 
@@ -204,7 +229,7 @@ function dispatch(command, positionals, values) {
 
 export async function main(argv) {
   // Checked before parseArgs: a bad flag must not make the hook exit non-zero.
-  if (argv[0] === 'hook') return runHook();
+  if (argv[0] === 'hook') return runHook(argv.slice(1));
   try {
     const { values, positionals } = parseArgs({ args: argv, options: OPTIONS, allowPositionals: true });
     const [command, ...rest] = positionals;

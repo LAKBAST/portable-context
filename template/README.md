@@ -1,6 +1,6 @@
 # Portable context
 
-Private context shared by Claude Code and Codex across devices. Managed with `pctx`.
+Private context shared by Claude Code, Codex and Antigravity across devices. Managed with `pctx`.
 
 - `AGENTS.md`: profile loaded in every session. Keep it short.
 - `projects/<repo-name>.md`: current state of a project, loaded when working in the repo of that name.

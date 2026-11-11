@@ -18,6 +18,7 @@ const HOOK_ID = 'pctx.js';
 const MATCHER = 'startup|resume|clear|compact';
 const SKILL_MARKER = '<!-- managed-by: portable-context -->';
 const DEFAULT_SKILL = 'save-context';
+const PLUGIN_NAME = 'portable-context';
 const SKILL_DESCRIPTION =
   'Save this session\'s decisions and state to the user\'s portable context repo. Use only when the user explicitly asks to save the context or session (for example "guarda el contexto" or "save context").';
 
@@ -34,6 +35,8 @@ function cliCommand() {
 export function targets() {
   const claudeHome = process.env.CLAUDE_CONFIG_DIR || join(os.homedir(), '.claude');
   const codexHome = process.env.CODEX_HOME || join(os.homedir(), '.codex');
+  const antigravityHome = process.env.ANTIGRAVITY_CONFIG_DIR || join(os.homedir(), '.gemini', 'config');
+  const pluginDir = join(antigravityHome, 'plugins', PLUGIN_NAME);
   return [
     {
       name: 'claude',
@@ -49,6 +52,16 @@ export function targets() {
       hookFile: join(codexHome, 'hooks.json'),
       skillsDir: join(os.homedir(), '.agents', 'skills'),
       hookExtra: { additionalContextLimit: 9000 },
+      skillFrontmatter: [],
+    },
+    {
+      // Antigravity loads hooks and skills from plugins; pctx owns this whole plugin folder.
+      name: 'antigravity',
+      plugin: true,
+      home: antigravityHome,
+      pluginDir,
+      hookFile: join(pluginDir, 'hooks.json'),
+      skillsDir: join(pluginDir, 'skills'),
       skillFrontmatter: [],
     },
   ];
@@ -126,7 +139,54 @@ function hookEntry(target) {
   };
 }
 
+// Antigravity hooks.json maps hook names to events, and SessionStart takes handlers directly.
+function hasOurPluginHook(data) {
+  return Object.values(data).some((spec) => Array.isArray(spec?.SessionStart) && spec.SessionStart.some(isOurHook));
+}
+
+function pluginHooks() {
+  return {
+    [PLUGIN_NAME]: {
+      SessionStart: [{ type: 'command', command: `${cliCommand()} hook --format antigravity`, timeout: 30 }],
+    },
+  };
+}
+
+function pluginManifest() {
+  return {
+    name: PLUGIN_NAME,
+    displayName: 'Portable context',
+    version: '1.0.0',
+    description: 'Loads your pctx context repo at session start and adds the skill that saves it.',
+  };
+}
+
+function assertPluginOwned(target) {
+  const dir = target.pluginDir;
+  if (!existsSync(dir) || !readdirSync(dir).length) return;
+  if (existsSync(target.hookFile) && hasOurPluginHook(readJson(target.hookFile))) return;
+  throw new Error(`${dir} exists and is not managed by pctx; move it away and retry (nothing was changed)`);
+}
+
+function installPlugin(target) {
+  writeJsonAtomic(join(target.pluginDir, 'plugin.json'), pluginManifest());
+  writeJsonAtomic(target.hookFile, pluginHooks());
+}
+
+function uninstallPlugin(target) {
+  if (!existsSync(target.hookFile) || !hasOurPluginHook(readJson(target.hookFile))) return false;
+  rmSync(target.hookFile);
+  rmSync(join(target.pluginDir, 'plugin.json'), { force: true });
+  return true;
+}
+
+// Only empty folders go, so anything the user added to the plugin stays.
+function removeIfEmpty(dir) {
+  if (existsSync(dir) && !readdirSync(dir).length) rmdirSync(dir);
+}
+
 function installHook(target) {
+  if (target.plugin) return installPlugin(target);
   const data = readJson(target.hookFile);
   const entries = withoutOurHook(data.hooks?.SessionStart ?? []);
   const next = { ...data, hooks: { ...data.hooks, SessionStart: [...entries, hookEntry(target)] } };
@@ -136,6 +196,7 @@ function installHook(target) {
 }
 
 function uninstallHook(target) {
+  if (target.plugin) return uninstallPlugin(target);
   const data = readJson(target.hookFile);
   if (!hasOurHook(data)) return false;
   const entries = withoutOurHook(data.hooks.SessionStart);
@@ -208,6 +269,7 @@ export function install(config) {
   // Validate every target first so a problem in one leaves the others untouched.
   for (const target of available) {
     readJson(target.hookFile);
+    if (target.plugin) assertPluginOwned(target);
     assertSkillWritable(target, name);
   }
   for (const target of available) {
@@ -225,6 +287,10 @@ export function uninstall(config) {
   for (const target of all) {
     const hook = uninstallHook(target);
     const skill = uninstallSkill(target, name);
+    if (target.plugin) {
+      removeIfEmpty(target.skillsDir);
+      removeIfEmpty(target.pluginDir);
+    }
     if (hook || skill) removed.push(target.name);
   }
   return removed;
@@ -236,7 +302,8 @@ export function removeSkill(name) {
 
 function hookStatus(target) {
   try {
-    return { hook: hasOurHook(readJson(target.hookFile)) };
+    const data = readJson(target.hookFile);
+    return { hook: target.plugin ? hasOurPluginHook(data) : hasOurHook(data) };
   } catch (err) {
     return { hook: false, problem: err.message };
   }
