@@ -74,6 +74,8 @@ Antigravity loads hooks and skills from plugins, so `pctx` installs its own plug
 
 The agent writes `sessions/YYYY-MM-DD-HHmm-<project>-<device>.md` (path from `pctx session-path`) and runs `pctx sync`.
 
+Each saved session also gets a `## Working style` section about the person using pctx: how they asked for things, what they corrected, what annoyed them, how they decided, with short quotes of their own words. The title stays in English in every language so tools can find it. When the same pattern shows up in two or more sessions and your profile does not say it yet, the agent proposes the exact line to add to `AGENTS.md` (or the file it points to) and only changes it if you agree. Over time your profile learns how you work, for every agent and device. For a project shared with a team, this section goes to your private session, never to the team repo.
+
 ## Edit your profile
 
 Replace the template text in `AGENTS.md` inside your context repo (`~/.pctx/context` by default) with your own preferences, then run `pctx sync`. It is loaded in every session on every device, so keep it short.

@@ -197,6 +197,9 @@ test('setup installs only for homes that exist', () => {
   assert.equal(pctxCommands(path.join(a.claude, 'settings.json')).length, 1);
   const skill = fs.readFileSync(path.join(a.claude, 'skills', 'save-context', 'SKILL.md'), 'utf8');
   assert.ok(skill.includes('managed-by: portable-context'));
+  assert.ok(skill.includes('## Working style'), 'the save skill records how the user works');
+  assert.ok(skill.includes('never in the team repo'), 'working style stays private for shared projects');
+  assert.ok(skill.includes('Change the profile only if they agree'), 'profile changes need the user');
   assert.ok(!fs.existsSync(a.codex));
   assert.ok(!fs.existsSync(path.join(a.home, '.agents', 'skills', 'save-context')));
 });

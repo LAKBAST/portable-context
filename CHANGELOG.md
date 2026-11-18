@@ -2,6 +2,13 @@
 
 All notable changes to this project are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses [Semantic Versioning](https://semver.org/).
 
+## [0.5.0] - 2026-11-18
+
+### Added
+
+- The save skill writes a `## Working style` section in every session about the person using pctx (how they asked, what they corrected or rejected, what annoyed them, how they decided, short literal quotes), so agents can learn how each user works. The title stays in English in every language so tools can find it; for a project shared with a team it goes to the private session.
+- When a working-style pattern repeats in two or more sessions and the profile does not say it yet, the save skill proposes the exact line to add to the profile and changes it only if the user agrees.
+
 ## [0.4.0] - 2026-11-11
 
 ### Added
