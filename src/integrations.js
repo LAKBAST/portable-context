@@ -228,13 +228,15 @@ Reply to the user in their language. If the user asked to share the project with
 
 1. Run \`${cli} session-path --cwd .\` (add \`--project <name>\` if the user names another project) and use the printed path. For a project shared with a team, the path is inside that team's repo.
 2. Write a short summary at that path: what was decided and why, what is pending, what was tried and failed. Leave out logs, tool output, and anything readable from the code.
-3. Update \`projects/<project>.md\` in the same repo as that path so it reflects only the current state, removing what is no longer true. Add a file under \`decisions/\` only for long-term decisions.
-4. A team repo is read by everyone in the team: keep it to the shared project. If the session also produced things that are not for the team (opinions about people or clients, the user's own pending tasks, anything they asked to keep private), run \`${cli} session-path --cwd . --private\` and write only those there. When unsure whether something is for the team, put it in the private file. If there is nothing private, write no private file.
-5. Never write credentials or personal data about others; refer to people by name.
-6. Run \`${cli} sync\`. It syncs the context repo and every team repo; with teams, each line starts with the repo it is about.
+3. Add a section titled exactly \`## Working style\` (keep this English title in any language, so tools can find it) about the person using pctx in this session, written in their language: how they asked for things, what they corrected or rejected and why, what annoyed them, what they insisted on checking, how they decided, and short literal quotes of their own words. Only what this session showed; no guesses, no judgments of other people, no personal data. If the session showed nothing new about how they work, write \`No new observations.\` For a project shared with a team, this section goes in the private session (step 5), never in the team repo.
+4. Update \`projects/<project>.md\` in the same repo as that path so it reflects only the current state, removing what is no longer true. Add a file under \`decisions/\` only for long-term decisions.
+5. A team repo is read by everyone in the team: keep it to the shared project. If the session also produced things that are not for the team (opinions about people or clients, the user's own pending tasks, the \`## Working style\` section, anything they asked to keep private), run \`${cli} session-path --cwd . --private\` and write only those there. When unsure whether something is for the team, put it in the private file. If there is nothing private, write no private file.
+6. Never write credentials or personal data about others; refer to people by name.
+7. Compare the new \`## Working style\` with the same section in earlier sessions of the context repo and with the profile (\`AGENTS.md\` and any file it points to). If a pattern repeats in two or more sessions and the profile does not say it yet, or contradicts it, propose to the user the exact line to add or change, in one or two lines. Change the profile only if they agree.
+8. Run \`${cli} sync\`. It syncs the context repo and every team repo; with teams, each line starts with the repo it is about.
    - \`blocked\`: remove the secret at the listed file:line, or ask the user if it is a false positive. Never bypass the check.
    - \`local-only\`: the save is committed on this device but has not reached the remote. Tell the user.
-7. Tell the user in one or two lines what went where (for example "saved to team lakbast; 2 private notes in your context repo") and whether it reached the remote.
+9. Tell the user in one or two lines what went where (for example "saved to team lakbast; 2 private notes in your context repo") and whether it reached the remote.
 `;
 }
 
