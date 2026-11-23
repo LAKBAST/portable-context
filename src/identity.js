@@ -8,6 +8,11 @@ const DOMAIN_HOST = /^(?:localhost|\[[0-9a-fA-F:]+\]|[a-zA-Z0-9-]+(?:\.[a-zA-Z0-
 const REMOTE_ID_PATTERN = /^[a-z0-9-]+--[0-9a-f]{10}$/;
 const LOCAL_ID_PATTERN = /^local--[a-z0-9-]+$/;
 const ALLOWED_SCHEMES = new Set(['http:', 'https:', 'ssh:', 'git:', 'git+ssh:', 'git+https:', 'file:']);
+export const DEFAULT_LIMITS = { profile: 3000, project: 4000, decision: 1500 };
+export const MAX_FILE_LIMIT = 100_000;
+export const DEFAULT_STALE_SAVE_DAYS = 7;
+export const MAX_STALE_SAVE_DAYS = 3650;
+const LIMIT_KEYS = new Set(Object.keys(DEFAULT_LIMITS));
 const DEFAULT_PORTS = {
   'http:': '80',
   'https:': '443',
@@ -476,12 +481,53 @@ function validateAliases(aliases, label, isolatedTeams, ownTeam = null) {
   return entries;
 }
 
+export function resolveLimits(config) {
+  const result = { ...DEFAULT_LIMITS };
+  const raw = config?.limits;
+  if (raw === undefined) return result;
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+    throw new Error('Invalid limits in config.json: expected an object with optional keys profile, project, decision');
+  }
+  for (const key of Object.keys(raw)) {
+    if (!LIMIT_KEYS.has(key)) {
+      throw new Error(`Unknown key "${key}" in limits in config.json (expected profile, project, decision)`);
+    }
+    const value = raw[key];
+    if (!Number.isInteger(value) || value < 1 || value > MAX_FILE_LIMIT) {
+      throw new Error(`Invalid limits.${key} in config.json: expected an integer between 1 and ${MAX_FILE_LIMIT}`);
+    }
+    result[key] = value;
+  }
+  return result;
+}
+
+export function resolveStaleSaveDays(config) {
+  const raw = config?.staleSaveDays;
+  if (raw === undefined) return DEFAULT_STALE_SAVE_DAYS;
+  if (!Number.isInteger(raw) || raw < 0 || raw > MAX_STALE_SAVE_DAYS) {
+    throw new Error(
+      `Invalid staleSaveDays in config.json: expected an integer between 0 and ${MAX_STALE_SAVE_DAYS} (0 disables)`,
+    );
+  }
+  return raw;
+}
+
 export function validateConfig(config, gitFn = null) {
-  if (!config || typeof config !== 'object') return { mode: 'legacy', personalAliases: [], teamAliases: new Map() };
+  if (!config || typeof config !== 'object') {
+    return {
+      mode: 'legacy',
+      personalAliases: [],
+      teamAliases: new Map(),
+      limits: { ...DEFAULT_LIMITS },
+      staleSaveDays: DEFAULT_STALE_SAVE_DAYS,
+    };
+  }
   const mode = config.projectIdentity ?? 'legacy';
   if (mode !== 'legacy' && mode !== 'remote') {
     throw new Error(`Invalid projectIdentity "${mode}" in config.json (expected "legacy" or "remote")`);
   }
+  const limits = resolveLimits(config);
+  const staleSaveDays = resolveStaleSaveDays(config);
   resolveScanRules(config.scanRules, 'scanRules in config.json');
   const teams = Array.isArray(config.teams) ? config.teams : [];
   const seenNames = new Set();
@@ -566,7 +612,7 @@ export function validateConfig(config, gitFn = null) {
   for (const team of teams) {
     teamAliases.set(team.name, validateAliases(team.aliases, `teams[${team.name}].aliases`, isolatedTeams, team));
   }
-  return { mode, personalAliases, teamAliases };
+  return { mode, personalAliases, teamAliases, limits, staleSaveDays };
 }
 
 export function validatePrivateDestination(config, team, gitFn) {

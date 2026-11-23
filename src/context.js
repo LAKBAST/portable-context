@@ -1,9 +1,11 @@
 import { spawnSync } from 'node:child_process';
-import { cpSync, existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { cpSync, existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
+  DEFAULT_LIMITS,
+  DEFAULT_STALE_SAVE_DAYS,
   hasScopeRules,
   isCanonicalProjectId,
   isInsideDir,
@@ -13,6 +15,8 @@ import {
   redactText,
   redactUrl,
   remoteProjectId,
+  resolveLimits,
+  resolveStaleSaveDays,
   slug,
   teamMatchesRemote,
   validateConfig,
@@ -41,8 +45,8 @@ const MIN_REFRESH_TIME = 2_000;
 const REFRESH_PUSH_TIMEOUT = 10_000;
 const SYNC_PUSH_TIMEOUT = 60_000;
 const CLONE_TIMEOUT = 120_000;
-const PROFILE_MAX = 3000;
-const PROJECT_MAX = 4000;
+const DECISIONS_INDEX_MAX_ITEMS = 20;
+const DECISIONS_INDEX_MAX_CHARS = 1500;
 const RECENT_SESSIONS = 3;
 
 export function configDir() {
@@ -833,51 +837,166 @@ function listSection(title, names) {
   return names.length ? [`## ${title}\n\n${names.map((name) => `- ${name}`).join('\n')}`] : [];
 }
 
-function profileSection(dir, heading = 'Profile') {
-  const file = join(dir, 'AGENTS.md');
-  const text = readIfExists(file);
-  return text ? [`## ${heading}\n\n${truncate(text, PROFILE_MAX, file)}`] : [];
+function resolveSafeSubdir(repoDir, subdir) {
+  if (!repoDir) return null;
+  const dir = join(repoDir, subdir);
+  if (!existsSync(dir)) return null;
+  try {
+    if (!statSync(dir).isDirectory()) return null;
+  } catch {
+    return null;
+  }
+  if (!isInsideDir(dir, repoDir)) return null;
+  if (normalizeRealPath(dir) === normalizeRealPath(repoDir)) return null;
+  return dir;
 }
 
-function readProjectNotes(dir, projectId, alias) {
-  const primaryFile = join(dir, 'projects', `${projectId}.md`);
-  const primaryText = readIfExists(primaryFile);
-  const aliasFile = alias ? join(dir, 'projects', `${alias}.md`) : null;
-  const aliasText = aliasFile ? readIfExists(aliasFile) : null;
+function isSafeRepoFile(repoDir, file) {
+  if (!existsSync(file)) return false;
+  try {
+    if (!statSync(file).isFile()) return false;
+  } catch {
+    return false;
+  }
+  return isInsideDir(file, repoDir);
+}
+
+function safeDecisionFiles(repoDir) {
+  const dir = resolveSafeSubdir(repoDir, 'decisions');
+  if (!dir) return { dir: null, files: [] };
+  const files = readdirSync(dir)
+    .filter((name) => name.endsWith('.md') && isSafeRepoFile(repoDir, join(dir, name)))
+    .sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+  return { dir, files };
+}
+
+function decisionsIndexSection(repos) {
+  const buckets = [];
+  let total = 0;
+  for (const repo of repos) {
+    const { dir: decisionsDir, files } = safeDecisionFiles(repo.dir);
+    if (!files.length) continue;
+    buckets.push({
+      label: repo.label,
+      decisionsDir,
+      items: files.map((name) => ({
+        name,
+        line: `- ${name} (${repo.label}: ${join(decisionsDir, name)})`,
+      })),
+    });
+    total += files.length;
+  }
+  if (!total) return [];
+
+  // Round-robin across repos within both item and character budgets so one repo cannot starve another.
+  const selectedByBucket = buckets.map(() => []);
+  let selectedCount = 0;
+  let usedChars = 0;
+  let cursor = 0;
+  let budgetFull = false;
+  while (!budgetFull && selectedCount < DECISIONS_INDEX_MAX_ITEMS && selectedCount < total) {
+    let addedInRound = false;
+    for (let i = 0; i < buckets.length && selectedCount < DECISIONS_INDEX_MAX_ITEMS; i++) {
+      if (cursor >= buckets[i].items.length) continue;
+      const item = buckets[i].items[cursor];
+      const nextChars = usedChars + (selectedCount ? 1 : 0) + item.line.length;
+      if (selectedCount > 0 && nextChars > DECISIONS_INDEX_MAX_CHARS) {
+        budgetFull = true;
+        break;
+      }
+      selectedByBucket[i].push(item);
+      selectedCount += 1;
+      usedChars = nextChars;
+      addedInRound = true;
+    }
+    if (!addedInRound) break;
+    cursor += 1;
+  }
+
+  const lines = selectedByBucket.flatMap((items) => items.map((item) => item.line));
+  const omittedDirs = [];
+  let omitted = 0;
+  for (let i = 0; i < buckets.length; i++) {
+    const missing = buckets[i].items.length - selectedByBucket[i].length;
+    if (missing > 0) {
+      omitted += missing;
+      omittedDirs.push(buckets[i].decisionsDir);
+    }
+  }
+  if (omitted > 0) {
+    lines.push(`- ... (${omitted} more; browse ${omittedDirs.join(', ')})`);
+  }
+  return [`## Decisions\n\n${lines.join('\n')}`];
+}
+
+function readScopedMarkdown(dir, subdir, projectId, alias, { checkInside = false } = {}) {
+  const baseDir = checkInside ? resolveSafeSubdir(dir, subdir) : join(dir, subdir);
+  if (!baseDir) {
+    return {
+      primaryFile: join(dir, subdir, `${projectId}.md`),
+      primaryText: null,
+      aliasFile: null,
+      aliasText: null,
+    };
+  }
+  const primaryFile = join(baseDir, `${projectId}.md`);
+  const primaryText = !checkInside || isSafeRepoFile(dir, primaryFile) ? readIfExists(primaryFile) : null;
+  const aliasFile = alias && alias !== projectId ? join(baseDir, `${alias}.md`) : null;
+  const aliasText = aliasFile && (!checkInside || isSafeRepoFile(dir, aliasFile)) ? readIfExists(aliasFile) : null;
   return { primaryFile, primaryText, aliasFile, aliasText };
 }
 
-function formatPersonalNotesBody(dir, projectId, alias) {
-  const { primaryFile, primaryText, aliasFile, aliasText } = readProjectNotes(dir, projectId, alias);
+function formatScopedBody({ primaryFile, primaryText, aliasFile, aliasText }, maxChars, label, emptyText = null) {
   if (primaryText && aliasText) {
-    return `${truncate(primaryText, PROJECT_MAX, primaryFile)}\n\n### Legacy alias notes (${aliasFile})\n\n${truncate(aliasText, PROJECT_MAX, aliasFile)}`;
+    return `${truncate(primaryText, maxChars, primaryFile)}\n\n### Legacy alias ${label} (${aliasFile})\n\n${truncate(aliasText, maxChars, aliasFile)}`;
   }
-  if (primaryText) return truncate(primaryText, PROJECT_MAX, primaryFile);
+  if (primaryText) return truncate(primaryText, maxChars, primaryFile);
   if (aliasText) {
-    return `(Loaded from declared alias ${aliasFile}; new notes use ${primaryFile}.)\n\n${truncate(aliasText, PROJECT_MAX, aliasFile)}`;
+    return `(Loaded from declared alias ${aliasFile}; new ${label} use ${primaryFile}.)\n\n${truncate(aliasText, maxChars, aliasFile)}`;
   }
-  return `No notes yet (${primaryFile}).`;
+  return emptyText;
 }
 
-function projectSection(dir, projectId, display, alias) {
+function projectDecisionSections(repos, projectId, decisionMax = DEFAULT_LIMITS.decision) {
+  if (!projectId) return [];
+  const sections = [];
+  for (const repo of repos) {
+    const data = readScopedMarkdown(repo.dir, 'decisions', projectId, repo.alias, { checkInside: true });
+    const body = formatScopedBody(data, decisionMax, 'decisions');
+    if (body) sections.push(`## ${repo.heading}\n\n${body}`);
+  }
+  return sections;
+}
+
+function profileSection(dir, heading = 'Profile', profileMax = DEFAULT_LIMITS.profile) {
+  const file = join(dir, 'AGENTS.md');
+  const text = readIfExists(file);
+  return text ? [`## ${heading}\n\n${truncate(text, profileMax, file)}`] : [];
+}
+
+function projectSection(dir, projectId, display, alias, projectMax = DEFAULT_LIMITS.project) {
   if (!projectId) return [];
   const header = `## Current project: ${projectId}`;
   const remoteLine = display && display !== projectId ? `Remote: ${display}\n\n` : '';
-  const body = formatPersonalNotesBody(dir, projectId, alias);
+  const data = readScopedMarkdown(dir, 'projects', projectId, alias);
+  const body = formatScopedBody(data, projectMax, 'notes', `No notes yet (${data.primaryFile}).`);
   return [`${header}\n\n${remoteLine}${body}`];
 }
 
-function teamProjectSections(privateDir, team, projectId, display, alias, { includePrivate = true } = {}) {
-  const { primaryFile, primaryText, aliasFile, aliasText } = readProjectNotes(team.dir, projectId, alias);
+function teamProjectSections(
+  privateDir,
+  team,
+  projectId,
+  display,
+  alias,
+  { includePrivate = true, profileMax = DEFAULT_LIMITS.profile, projectMax = DEFAULT_LIMITS.project } = {},
+) {
+  const data = readScopedMarkdown(team.dir, 'projects', projectId, alias);
   const sections = [];
   const teamProfile = readIfExists(join(team.dir, 'AGENTS.md'));
-  if (teamProfile) sections.push(`## Team ${team.name}\n\n${truncate(teamProfile, PROFILE_MAX, join(team.dir, 'AGENTS.md'))}`);
+  if (teamProfile) sections.push(`## Team ${team.name}\n\n${truncate(teamProfile, profileMax, join(team.dir, 'AGENTS.md'))}`);
   const remoteLine = display && display !== projectId ? `Remote: ${display}\n\n` : '';
-  let body;
-  if (primaryText) body = truncate(primaryText, PROJECT_MAX, primaryFile);
-  else if (aliasText) {
-    body = `(Loaded from declared alias ${aliasFile}; new notes use ${primaryFile}.)\n\n${truncate(aliasText, PROJECT_MAX, aliasFile)}`;
-  } else body = `No notes yet (${primaryFile}).`;
+  const body = formatScopedBody(data, projectMax, 'notes', `No notes yet (${data.primaryFile}).`);
   sections.push(
     `## Current project: ${projectId} (shared in team ${team.name})\n\n` +
       remoteLine +
@@ -885,12 +1004,9 @@ function teamProjectSections(privateDir, team, projectId, display, alias, { incl
       body,
   );
   if (includePrivate && privateDir) {
-    const priv = readProjectNotes(privateDir, projectId, alias);
-    const privText = priv.primaryText ?? priv.aliasText;
-    const privFile = priv.primaryText ? priv.primaryFile : priv.aliasFile;
-    if (privText) {
-      sections.push(`## Your private notes for ${projectId}\n\n${truncate(privText, PROJECT_MAX, privFile)}`);
-    }
+    const priv = readScopedMarkdown(privateDir, 'projects', projectId, alias);
+    const privBody = formatScopedBody(priv, projectMax, 'notes');
+    if (privBody) sections.push(`## Your private notes for ${projectId}\n\n${privBody}`);
   }
   return sections;
 }
@@ -906,9 +1022,70 @@ function sessionMatchesProject(filename, projectId, alias) {
 
 function recentSessions(dir, projectId, alias = null) {
   if (!projectId) return [];
-  return markdownFiles(join(dir, 'sessions'))
-    .filter((name) => sessionMatchesProject(name, projectId, alias))
+  const sessionsDir = resolveSafeSubdir(dir, 'sessions');
+  if (!sessionsDir) return [];
+  return readdirSync(sessionsDir)
+    .filter((name) => name.endsWith('.md') && sessionMatchesProject(name, projectId, alias) && isSafeRepoFile(dir, join(sessionsDir, name)))
+    .sort()
     .slice(-RECENT_SESSIONS);
+}
+
+function calendarDayNumber(year, month, day) {
+  return Math.floor(Date.UTC(year, month - 1, day) / 86_400_000);
+}
+
+function parseSessionDate(filename) {
+  const match = /^(\d{4})-(\d{2})-(\d{2})-(\d{2})(\d{2})-(.+)\.md$/.exec(filename);
+  if (!match) return null;
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  const hour = Number(match[4]);
+  const minute = Number(match[5]);
+  if (month < 1 || month > 12 || day < 1 || day > 31 || hour > 23 || minute > 59) return null;
+  const check = new Date(Date.UTC(year, month - 1, day));
+  if (
+    check.getUTCFullYear() !== year ||
+    check.getUTCMonth() !== month - 1 ||
+    check.getUTCDate() !== day
+  ) {
+    return null;
+  }
+  return {
+    dateStr: `${match[1]}-${match[2]}-${match[3]}`,
+    dayNumber: calendarDayNumber(year, month, day),
+  };
+}
+
+function latestProjectSave(repos, projectId, todayNumber) {
+  let latest = null;
+  for (const { dir, alias } of repos) {
+    const sessionsDir = resolveSafeSubdir(dir, 'sessions');
+    if (!sessionsDir) continue;
+    for (const name of readdirSync(sessionsDir)) {
+      if (!name.endsWith('.md') || !sessionMatchesProject(name, projectId, alias)) continue;
+      if (!isSafeRepoFile(dir, join(sessionsDir, name))) continue;
+      const parsed = parseSessionDate(name);
+      // Ignore malformed dates and future dates so a future-dated file never silences stale saves.
+      if (!parsed || parsed.dayNumber > todayNumber) continue;
+      if (!latest || parsed.dayNumber > latest.dayNumber) latest = parsed;
+    }
+  }
+  return latest;
+}
+
+function staleSaveReminder(repos, projectId, staleSaveDays, now) {
+  if (!projectId || staleSaveDays === 0) return [];
+  const todayNumber = calendarDayNumber(now.getFullYear(), now.getMonth() + 1, now.getDate());
+  const latest = latestProjectSave(repos, projectId, todayNumber);
+  if (!latest) return [];
+  const ageDays = todayNumber - latest.dayNumber;
+  if (ageDays < staleSaveDays) return [];
+  const ageUnit = ageDays === 1 ? 'day' : 'days';
+  const thresholdUnit = staleSaveDays === 1 ? 'day' : 'days';
+  return [
+    `REMINDER: Latest saved session for ${projectId} is from ${latest.dateStr} (${ageDays} calendar ${ageUnit} ago; threshold: ${staleSaveDays} ${thresholdUnit}).`,
+  ];
 }
 
 function warningLine(label, result) {
@@ -923,7 +1100,15 @@ function excludedNames(projectId, alias) {
   return excluded;
 }
 
-function buildIsolatedContext(team, resolved, teamResults, privateResult) {
+function buildIsolatedContext(
+  team,
+  resolved,
+  teamResults,
+  privateResult,
+  limits = DEFAULT_LIMITS,
+  staleSaveDays = DEFAULT_STALE_SAVE_DAYS,
+  now = new Date(),
+) {
   const projectId = resolved.projectId;
   const excluded = excludedNames(projectId, resolved.alias);
   const others = markdownFiles(join(team.dir, 'projects')).filter((name) => !excluded.has(name));
@@ -935,17 +1120,28 @@ function buildIsolatedContext(team, resolved, teamResults, privateResult) {
   }
   const teamSessions = recentSessions(team.dir, projectId, resolved.alias);
   const privateSessions = privateUsable ? recentSessions(team.privateDir, projectId, resolved.alias) : [];
+  const contextRepos = [
+    { label: `team ${team.name}`, dir: team.dir, alias: resolved.alias, heading: `Team ${team.name} decisions for ${projectId}` },
+    ...(privateUsable
+      ? [{ label: `private ${team.name}`, dir: team.privateDir, alias: resolved.alias, heading: `Your private decisions for ${projectId}` }]
+      : []),
+  ];
   return [
     `# Portable context (team ${team.name})`,
     `Team repo: ${team.dir}`,
     ...(team.privateDir ? [`Private repo: ${team.privateDir}`] : []),
     ...warningLine(`team ${team.name}`, teamResults[team.name]),
     ...(team.privateDir ? warningLine(`private ${team.name}`, privateResult) : []),
-    ...(privateUsable ? profileSection(team.privateDir, `Your private profile (team ${team.name})`) : []),
+    ...staleSaveReminder(contextRepos, projectId, staleSaveDays, now),
+    ...(privateUsable ? profileSection(team.privateDir, `Your private profile (team ${team.name})`, limits.profile) : []),
     ...teamProjectSections(team.privateDir, team, projectId, resolved.display, resolved.alias, {
       includePrivate: privateUsable,
+      profileMax: limits.profile,
+      projectMax: limits.project,
     }),
+    ...projectDecisionSections(contextRepos, projectId, limits.decision),
     ...listSection('Other projects', others),
+    ...decisionsIndexSection(contextRepos),
     ...listSection(`Recent team sessions for this project (${join(team.dir, 'sessions')})`, teamSessions),
     ...(privateUsable
       ? listSection(`Recent private sessions for this project (${join(team.privateDir, 'sessions')})`, privateSessions)
@@ -955,9 +1151,12 @@ function buildIsolatedContext(team, resolved, teamResults, privateResult) {
 
 // `teamResults` maps a team name to the result of refreshing that team repo.
 export function buildContext(config, cwd, syncResult, teamResults = {}, extra = {}) {
+  const limits = resolveLimits(config);
+  const staleSaveDays = resolveStaleSaveDays(config);
+  const now = extra.now instanceof Date ? extra.now : new Date();
   const resolved = extra.resolved ?? resolveScope(config, { cwd, allowConflict: true });
   if (resolved.scopeKind === 'isolated' && resolved.isolatedTeam && !resolved.conflict) {
-    return buildIsolatedContext(resolved.isolatedTeam, resolved, teamResults, extra.privateResult);
+    return buildIsolatedContext(resolved.isolatedTeam, resolved, teamResults, extra.privateResult, limits, staleSaveDays, now);
   }
   if (resolved.conflict && (resolved.scopeKind === 'isolated' || resolved.isolatedTeam)) {
     return `Portable context unavailable: ${resolved.conflict}`;
@@ -978,6 +1177,18 @@ export function buildContext(config, cwd, syncResult, teamResults = {}, extra = 
     ? [`Team repos: ${nonIsolatedTeams.map((t) => `${t.name} (${t.dir})`).join(', ')}`]
     : [];
   const teamSessions = team ? recentSessions(team.dir, projectId, resolved.alias) : [];
+  const personalAlias = team
+    ? Object.entries(config.aliases ?? {}).find(
+        ([, remote]) => resolved.display && parseRemote(remote, { allowShorthand: true })?.canonical === resolved.display,
+      )?.[0]
+    : resolved.alias;
+  // A team alias applies to that team's notes and sessions only.
+  const contextRepos = [
+    { label: 'personal', dir, alias: personalAlias, heading: `${team ? 'Your private decisions for' : 'Project decisions:'} ${projectId}` },
+    ...(team
+      ? [{ label: `team ${team.name}`, dir: team.dir, alias: resolved.alias, heading: `Team ${team.name} decisions for ${projectId}` }]
+      : []),
+  ];
   return [
     '# Portable context',
     `Context repo: ${dir}`,
@@ -985,12 +1196,18 @@ export function buildContext(config, cwd, syncResult, teamResults = {}, extra = 
     ...warningLine('the context', syncResult),
     ...nonIsolatedTeams.flatMap((t) => warningLine(`team ${t.name}`, teamResults[t.name])),
     ...(resolved.conflict ? [`WARNING: ${resolved.conflict}. Tell the user.`] : []),
-    ...profileSection(dir),
+    ...staleSaveReminder(contextRepos, projectId, staleSaveDays, now),
+    ...profileSection(dir, 'Profile', limits.profile),
     ...(team
-      ? teamProjectSections(dir, team, projectId, resolved.display, resolved.alias)
-      : projectSection(dir, projectId, resolved.display, resolved.alias)),
+      ? teamProjectSections(dir, team, projectId, resolved.display, resolved.alias, {
+          profileMax: limits.profile,
+          projectMax: limits.project,
+        })
+      : projectSection(dir, projectId, resolved.display, resolved.alias, limits.project)),
+    ...projectDecisionSections(contextRepos, projectId, limits.decision),
     ...listSection('Other projects', others),
-    ...listSection('Recent sessions for this project', recentSessions(dir, projectId, resolved.alias)),
+    ...decisionsIndexSection(contextRepos),
+    ...listSection('Recent sessions for this project', recentSessions(dir, projectId, personalAlias)),
     ...listSection(`Recent team sessions for this project (${join(team?.dir ?? '', 'sessions')})`, teamSessions),
   ].join('\n\n');
 }
