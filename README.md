@@ -209,11 +209,59 @@ How isolated teams behave across commands:
 | `pctx hook [--format antigravity]` | SessionStart hook: reads `{cwd}` (or Antigravity's `workspacePaths`) JSON on stdin, pulls the active scope, prints context (as `injectSteps` JSON with `--format antigravity`). Always exits 0 |
 | `pctx session-path [--project] [--cwd] [--team] [--private]` | Print a new session file path and create `sessions/` (in the team repo for a shared/isolated project; `--private` uses your personal repo or the isolated team's `privateDir`) |
 | `pctx sync [-m] [--cwd] [--team]` | Scan, commit, pull and push the active scope (personal + non-isolated teams, or the isolated team + its `privateDir`). Prints `synced` or `up-to-date` |
-| `pctx scan [--cwd] [--team]` | Scan pending changes in the active scope for secrets: `clean` or findings |
+| `pctx scan [--cwd] [--team]` | Scan pending changes in the active scope for secrets and configured rules: `clean` or findings |
 
-`sync` exit codes: 0 success; 2 a possible secret was found (nothing is committed in that repo, findings are listed as `file:line (rule)` without the value); 1 pull or push failed (`local-only: ...` on stderr, the commit is kept locally). With teams, the worst result of all repos sets the exit code.
+`sync` exit codes: 0 success; 2 a possible secret or configured personal-data match was found (nothing is committed or pushed in that repo, findings are listed as `file:line (rule)` without the value); 1 pull or push failed (`local-only: ...` on stderr, the commit is kept locally). With teams, the worst result of all repos sets the exit code.
 
 Settings files are edited conservatively: other keys and hooks are preserved, invalid JSON is left unchanged and the command fails, the first change creates `<file>.pctx-backup`, and an existing `SKILL.md` that lacks `managed-by: portable-context` is never overwritten.
+
+## Secret and configurable personal-data scanning
+
+`pctx scan` and `pctx sync` always check added lines for global credential patterns (including private keys, cloud/API tokens, `GOCSPX-` Google OAuth client secrets, JWTs, connection strings, and literal secret assignments) on every repository.
+
+In addition, you can opt in to built-in personal-data rules independently per repository destination in `~/.pctx/config.json`:
+
+- **Personal context repo (`contextDir`)**: top-level `"scanRules"`
+- **Team shared repo (`teams[].dir`)**: `"scanRules"` on that team entry
+- **Isolated team private repo (`teams[].privateDir`)**: `"privateScanRules"` on that team entry
+
+When a repository omits these fields, behavior is unchanged (only global credential rules run).
+
+```json
+{
+  "contextDir": "/home/alex/.pctx/context",
+  "device": "laptop",
+  "skillName": "save-context",
+  "scanRules": ["es-dni", "es-iban"],
+  "teams": [
+    {
+      "name": "acme",
+      "url": "https://git.acme.example/platform/pctx-team.git",
+      "dir": "/home/alex/.pctx/teams/acme",
+      "isolated": true,
+      "namespaces": ["git.acme.example/platform"],
+      "scanRules": ["es-pii"],
+      "privateDir": "/home/alex/.pctx/teams/acme-private",
+      "privateUrl": "https://git.acme.example/alex/pctx-private.git",
+      "privateScanRules": ["es-mobile"]
+    }
+  ]
+}
+```
+
+Available built-in IDs (collections and individual rules):
+
+- `"es-pii"` (collection): enables all four rules below
+- `"es-dni"`: Spanish DNI (8 digits + validated mod-23 control letter, e.g. `00000001R`)
+- `"es-nie"`: Spanish NIE (`X`/`Y`/`Z` + 7 digits + validated mod-23 control letter, e.g. `X0000000T`)
+- `"es-iban"`: Spanish IBAN (`ES` + 22 digits, compact or grouped, mod-97 validated, e.g. `ES8200000000000000000000` or `ES55 0000 0000 0000 0000 0001`)
+- `"es-mobile"`: Spanish mobile numbers starting with `6` or `7`, `+34` prefix, and common separators (e.g. `+34 600 000 000`)
+
+Validation and safety guarantees:
+
+- Rule names and types are validated up front (`setup`, `team add`, `scan`, `sync`, `doctor`): unknown rule IDs, non-array values, or `privateScanRules` without a `privateDir` fail before any commit or push runs.
+- Findings block only the affected repository (without committing or pushing it), exit with code `2`, and print `<file>:<line> (<rule>)` without printing the detected value.
+- Arbitrary user-defined regexes are not supported.
 
 ## What is synced, and what is not
 
@@ -221,7 +269,7 @@ Synced: the markdown in your context repo, and in each team repo you added. Noth
 
 Never synced: your agents' own settings, credentials, or transcripts. Only what is written into the context repo is pushed.
 
-Secret scanning runs before each commit and blocks known token and private key patterns. It is a best-effort safety net, not a guarantee. Do not put secrets in your context.
+Scanning runs only on the added lines that `pctx scan` / `pctx sync` stages for commit in each active repository. It does not scan or rewrite existing git history, remote history, or `pctx hook` startup pulls. It is a best-effort safety net, not a guarantee: free-form text such as people's names, postal addresses, unstructured notes, or identifiers outside the enabled built-in formats are not detected. Do not put secrets or sensitive personal data in your context.
 
 ## Limitations
 
