@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import {
+  isInsideDir,
   matchesNamespace,
   parseNamespace,
   parseRemote,
@@ -12,6 +13,7 @@ import {
   redactUrl,
   remoteProjectId,
   resolveLimits,
+  resolveStaleSaveDays,
   localProjectId,
   validateConfig,
 } from '../src/identity.js';
@@ -223,4 +225,27 @@ test('resolveLimits and validateConfig enforce bounded positive integers for per
     assert.throws(() => validateConfig({ limits: { project: badVal } }), /Invalid limits\.project/);
     assert.throws(() => validateConfig({ limits: { decision: badVal } }), /Invalid limits\.decision/);
   }
+});
+
+test('resolveStaleSaveDays and validateConfig validate staleSaveDays bounds and Windows/POSIX path helpers', () => {
+  assert.equal(resolveStaleSaveDays({}), 7);
+  assert.equal(resolveStaleSaveDays({ staleSaveDays: 0 }), 0);
+  assert.equal(resolveStaleSaveDays({ staleSaveDays: 3650 }), 3650);
+  assert.doesNotThrow(() => validateConfig({ staleSaveDays: 0 }));
+
+  for (const badDays of [-1, 1.5, '7', null, true, 3651]) {
+    assert.throws(() => validateConfig({ staleSaveDays: badDays }), /Invalid staleSaveDays/);
+  }
+
+  // Windows drive/UNC and POSIX path parsing + isInsideDir regression.
+  const winDrive = parseRemote('D:\\Work\\Repos\\My-App.git');
+  const winSlash = parseRemote('D:/Work/Repos/My-App.git');
+  assert.equal(winDrive.kind, 'local');
+  assert.equal(winDrive.canonical, winSlash.canonical);
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'pctx-native-'));
+  tmpDirs.push(root);
+  const inside = path.join(root, 'decisions', 'app.md');
+  const outside = path.join(path.dirname(root), 'other', 'app.md');
+  assert.ok(isInsideDir(inside, root));
+  assert.ok(!isInsideDir(outside, root));
 });

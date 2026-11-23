@@ -5,6 +5,7 @@ import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   DEFAULT_LIMITS,
+  DEFAULT_STALE_SAVE_DAYS,
   hasScopeRules,
   isCanonicalProjectId,
   isInsideDir,
@@ -15,6 +16,7 @@ import {
   redactUrl,
   remoteProjectId,
   resolveLimits,
+  resolveStaleSaveDays,
   slug,
   teamMatchesRemote,
   validateConfig,
@@ -1020,9 +1022,70 @@ function sessionMatchesProject(filename, projectId, alias) {
 
 function recentSessions(dir, projectId, alias = null) {
   if (!projectId) return [];
-  return markdownFiles(join(dir, 'sessions'))
-    .filter((name) => sessionMatchesProject(name, projectId, alias))
+  const sessionsDir = resolveSafeSubdir(dir, 'sessions');
+  if (!sessionsDir) return [];
+  return readdirSync(sessionsDir)
+    .filter((name) => name.endsWith('.md') && sessionMatchesProject(name, projectId, alias) && isSafeRepoFile(dir, join(sessionsDir, name)))
+    .sort()
     .slice(-RECENT_SESSIONS);
+}
+
+function calendarDayNumber(year, month, day) {
+  return Math.floor(Date.UTC(year, month - 1, day) / 86_400_000);
+}
+
+function parseSessionDate(filename) {
+  const match = /^(\d{4})-(\d{2})-(\d{2})-(\d{2})(\d{2})-(.+)\.md$/.exec(filename);
+  if (!match) return null;
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  const hour = Number(match[4]);
+  const minute = Number(match[5]);
+  if (month < 1 || month > 12 || day < 1 || day > 31 || hour > 23 || minute > 59) return null;
+  const check = new Date(Date.UTC(year, month - 1, day));
+  if (
+    check.getUTCFullYear() !== year ||
+    check.getUTCMonth() !== month - 1 ||
+    check.getUTCDate() !== day
+  ) {
+    return null;
+  }
+  return {
+    dateStr: `${match[1]}-${match[2]}-${match[3]}`,
+    dayNumber: calendarDayNumber(year, month, day),
+  };
+}
+
+function latestProjectSave(dirs, projectId, alias, todayNumber) {
+  let latest = null;
+  for (const dir of dirs) {
+    const sessionsDir = resolveSafeSubdir(dir, 'sessions');
+    if (!sessionsDir) continue;
+    for (const name of readdirSync(sessionsDir)) {
+      if (!name.endsWith('.md') || !sessionMatchesProject(name, projectId, alias)) continue;
+      if (!isSafeRepoFile(dir, join(sessionsDir, name))) continue;
+      const parsed = parseSessionDate(name);
+      // Ignore malformed dates and future dates so a future-dated file never silences stale saves.
+      if (!parsed || parsed.dayNumber > todayNumber) continue;
+      if (!latest || parsed.dayNumber > latest.dayNumber) latest = parsed;
+    }
+  }
+  return latest;
+}
+
+function staleSaveReminder(dirs, projectId, alias, staleSaveDays, now) {
+  if (!projectId || staleSaveDays === 0) return [];
+  const todayNumber = calendarDayNumber(now.getFullYear(), now.getMonth() + 1, now.getDate());
+  const latest = latestProjectSave(dirs, projectId, alias, todayNumber);
+  if (!latest) return [];
+  const ageDays = todayNumber - latest.dayNumber;
+  if (ageDays < staleSaveDays) return [];
+  const ageUnit = ageDays === 1 ? 'day' : 'days';
+  const thresholdUnit = staleSaveDays === 1 ? 'day' : 'days';
+  return [
+    `REMINDER: Latest saved session for ${projectId} is from ${latest.dateStr} (${ageDays} calendar ${ageUnit} ago; threshold: ${staleSaveDays} ${thresholdUnit}).`,
+  ];
 }
 
 function warningLine(label, result) {
@@ -1037,7 +1100,15 @@ function excludedNames(projectId, alias) {
   return excluded;
 }
 
-function buildIsolatedContext(team, resolved, teamResults, privateResult, limits = DEFAULT_LIMITS) {
+function buildIsolatedContext(
+  team,
+  resolved,
+  teamResults,
+  privateResult,
+  limits = DEFAULT_LIMITS,
+  staleSaveDays = DEFAULT_STALE_SAVE_DAYS,
+  now = new Date(),
+) {
   const projectId = resolved.projectId;
   const excluded = excludedNames(projectId, resolved.alias);
   const others = markdownFiles(join(team.dir, 'projects')).filter((name) => !excluded.has(name));
@@ -1055,12 +1126,14 @@ function buildIsolatedContext(team, resolved, teamResults, privateResult, limits
       ? [{ label: `private ${team.name}`, dir: team.privateDir, heading: `Your private decisions for ${projectId}` }]
       : []),
   ];
+  const visibleSessionDirs = [team.dir, ...(privateUsable ? [team.privateDir] : [])];
   return [
     `# Portable context (team ${team.name})`,
     `Team repo: ${team.dir}`,
     ...(team.privateDir ? [`Private repo: ${team.privateDir}`] : []),
     ...warningLine(`team ${team.name}`, teamResults[team.name]),
     ...(team.privateDir ? warningLine(`private ${team.name}`, privateResult) : []),
+    ...staleSaveReminder(visibleSessionDirs, projectId, resolved.alias, staleSaveDays, now),
     ...(privateUsable ? profileSection(team.privateDir, `Your private profile (team ${team.name})`, limits.profile) : []),
     ...teamProjectSections(team.privateDir, team, projectId, resolved.display, resolved.alias, {
       includePrivate: privateUsable,
@@ -1080,9 +1153,11 @@ function buildIsolatedContext(team, resolved, teamResults, privateResult, limits
 // `teamResults` maps a team name to the result of refreshing that team repo.
 export function buildContext(config, cwd, syncResult, teamResults = {}, extra = {}) {
   const limits = resolveLimits(config);
+  const staleSaveDays = resolveStaleSaveDays(config);
+  const now = extra.now instanceof Date ? extra.now : new Date();
   const resolved = extra.resolved ?? resolveScope(config, { cwd, allowConflict: true });
   if (resolved.scopeKind === 'isolated' && resolved.isolatedTeam && !resolved.conflict) {
-    return buildIsolatedContext(resolved.isolatedTeam, resolved, teamResults, extra.privateResult, limits);
+    return buildIsolatedContext(resolved.isolatedTeam, resolved, teamResults, extra.privateResult, limits, staleSaveDays, now);
   }
   if (resolved.conflict && (resolved.scopeKind === 'isolated' || resolved.isolatedTeam)) {
     return `Portable context unavailable: ${resolved.conflict}`;
@@ -1113,6 +1188,7 @@ export function buildContext(config, cwd, syncResult, teamResults = {}, extra = 
         { dir, heading: `Your private decisions for ${projectId}` },
       ]
     : [{ dir, heading: `Project decisions: ${projectId}` }];
+  const visibleSessionDirs = [dir, ...(team ? [team.dir] : [])];
   return [
     '# Portable context',
     `Context repo: ${dir}`,
@@ -1120,6 +1196,7 @@ export function buildContext(config, cwd, syncResult, teamResults = {}, extra = 
     ...warningLine('the context', syncResult),
     ...nonIsolatedTeams.flatMap((t) => warningLine(`team ${t.name}`, teamResults[t.name])),
     ...(resolved.conflict ? [`WARNING: ${resolved.conflict}. Tell the user.`] : []),
+    ...staleSaveReminder(visibleSessionDirs, projectId, resolved.alias, staleSaveDays, now),
     ...profileSection(dir, 'Profile', limits.profile),
     ...(team
       ? teamProjectSections(dir, team, projectId, resolved.display, resolved.alias, {

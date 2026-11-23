@@ -5,6 +5,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { buildContext } from '../src/context.js';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const BIN = path.join(ROOT, 'bin', 'pctx.js');
@@ -1917,4 +1918,95 @@ test('default and configured per-file limits truncate profile, project notes, an
 
   // Codex additionalContextLimit integration rule stays unchanged at 9000.
   assert.equal(readJson(path.join(alex.codex, 'hooks.json')).hooks.SessionStart[0].hooks[0].additionalContextLimit, 9000);
+});
+
+// ---------------------------------------------------------------- stale-save reminder
+
+test('stale-save reminder checks calendar days across visible stores, ignores invalid/future dates, and respects threshold 0', () => {
+  const sb = makeSandbox();
+  const acmeRemote = makeRemote(sb, 'acme-team');
+  const acmePrivRemote = makeRemote(sb, 'acme-priv');
+  const alex = makeDevice(sb, 'alex-laptop');
+  setup(alex, sb, ['--author', 'alex', '--project-identity', 'remote']);
+  teamAdd(alex, 'acme', acmeRemote, [
+    '--isolated',
+    '--namespace', 'git.acme.example/platform',
+    '--private-url', acmePrivRemote,
+  ]);
+
+  const persRepo = makeProjectRepo(alex, 'solo', 'https://github.com/alex/solo.git');
+  const corpRepo = makeProjectRepo(alex, 'payments', 'https://git.acme.example/platform/payments.git');
+  const persSess = pctx(alex, ['session-path', '--cwd', persRepo]).stdout.trim();
+  const persId = path.basename(persSess).replace(/^\d{4}-\d{2}-\d{2}-\d{4}-/, '').replace(new RegExp(`-${alex.name}\\.md$`), '');
+  const corpSess = pctx(alex, ['session-path', '--cwd', corpRepo]).stdout.trim();
+  const corpId = path.basename(corpSess).replace(/^\d{4}-\d{2}-\d{2}-\d{4}-/, '').replace(new RegExp(`-(?:alex-)?${alex.name}\\.md$`), '');
+
+  const acmeDir = path.join(alex.pctxHome, 'teams', 'acme');
+  const acmePrivDir = path.join(alex.pctxHome, 'teams', 'acme-private');
+  const cfg = () => readJson(path.join(alex.pctxHome, 'config.json'));
+
+  // 1) No saved sessions yet -> no reminder and no failure-like warning.
+  const hEmpty = hook(alex, persRepo);
+  assert.equal(hEmpty.status, 0);
+  assert.ok(!hEmpty.stdout.includes('REMINDER:'));
+  assert.ok(!hEmpty.stdout.includes('WARNING:'));
+
+  // 2) Exact calendar-day boundary with reproducible `now` (2026-11-23):
+  //    6 days ago (2026-11-17) -> no reminder; 7 days ago (2026-11-16) -> reminder fires.
+  const now = new Date(2026, 10, 23, 8, 15);
+  write(path.join(alex.context, 'sessions', `2026-11-16-2350-${persId}-${alex.name}.md`), '# 7 days ago\n');
+  // Malformed dates, non-standard names, and future dates must be ignored and never silence the reminder!
+  write(path.join(alex.context, 'sessions', `2026-02-30-1000-${persId}-${alex.name}.md`), '# invalid feb 30\n');
+  write(path.join(alex.context, 'sessions', `2025-02-29-1000-${persId}-${alex.name}.md`), '# invalid non-leap\n');
+  write(path.join(alex.context, 'sessions', `2026-13-01-1000-${persId}-${alex.name}.md`), '# invalid month\n');
+  write(path.join(alex.context, 'sessions', `2026-11-22-2500-${persId}-${alex.name}.md`), '# invalid hour\n');
+  write(path.join(alex.context, 'sessions', `2099-01-01-1000-${persId}-${alex.name}.md`), '# future date\n');
+  write(path.join(alex.context, 'sessions', `badname-${persId}.md`), '# non-standard\n');
+
+  const out7 = buildContext(cfg(), persRepo, { ok: true }, {}, { now });
+  assert.match(out7, new RegExp(`REMINDER: Latest saved session for ${persId} is from 2026-11-16 \\(7 calendar days ago; threshold: 7 days\\)`));
+
+  // Threshold 0 disables the reminder completely.
+  const outDisabled = buildContext({ ...cfg(), staleSaveDays: 0 }, persRepo, { ok: true }, {}, { now });
+  assert.ok(!outDisabled.includes('REMINDER:'));
+
+  // CLI hook end-to-end with an old save and threshold 0 in config.json.
+  const hCliStale = hook(alex, persRepo);
+  assert.equal(hCliStale.status, 0);
+  assert.ok(hCliStale.stdout.includes('REMINDER: Latest saved session'));
+  assert.ok(!hCliStale.stdout.includes('unsaved'));
+  updateConfig(alex, (c) => { c.staleSaveDays = 0; });
+  const hCliDisabled = hook(alex, persRepo);
+  assert.equal(hCliDisabled.status, 0);
+  assert.ok(!hCliDisabled.stdout.includes('REMINDER:'));
+  updateConfig(alex, (c) => { delete c.staleSaveDays; });
+
+  // Adding a 6-day-old session silences the default 7-day reminder, while custom threshold 5 triggers it.
+  const recentSess = path.join(alex.context, 'sessions', `2026-11-17-2200-${persId}-${alex.name}.md`);
+  write(recentSess, '# 6 days ago\n');
+  const out6 = buildContext(cfg(), persRepo, { ok: true }, {}, { now });
+  assert.ok(!out6.includes('REMINDER:'));
+  const outThresh5 = buildContext({ ...cfg(), staleSaveDays: 5 }, persRepo, { ok: true }, {}, { now });
+  assert.match(outThresh5, /REMINDER: .*2026-11-17 \(6 calendar days ago; threshold: 5 days\)/);
+
+  // 3) Isolated team + private repo isolation:
+  //    Personal saves never silence or trigger isolated team reminders, and isolated private saves count for that team.
+  write(path.join(acmeDir, 'sessions', `2026-11-01-1000-${corpId}-alex-${alex.name}.md`), '# old corp\n');
+  const corpStale = buildContext(cfg(), corpRepo, { ok: true }, { acme: { ok: true } }, { now, privateResult: { ok: true } });
+  assert.match(corpStale, new RegExp(`REMINDER: Latest saved session for ${corpId} is from 2026-11-01 \\(22 calendar days ago; threshold: 7 days\\)`));
+
+  // A recent save in acme-private counts as a visible save for the isolated project.
+  write(path.join(acmePrivDir, 'sessions', `2026-11-20-1000-${corpId}-${alex.name}.md`), '# recent priv\n');
+  const corpFresh = buildContext(cfg(), corpRepo, { ok: true }, { acme: { ok: true } }, { now, privateResult: { ok: true } });
+  assert.ok(!corpFresh.includes('REMINDER:'));
+
+  // Explicit migration alias session counts only for the declared remote, never for another remote with same basename.
+  write(path.join(alex.context, 'sessions', `2026-10-01-1000-legacyapi-${alex.name}.md`), '# legacy alias save\n');
+  updateConfig(alex, (c) => { c.aliases = { legacyapi: 'github.com/alex/myapi' }; });
+  const aliasedRepo = makeProjectRepo(alex, 'alex-myapi', 'https://github.com/alex/myapi.git');
+  const otherRepo = makeProjectRepo(alex, 'other-myapi', 'https://github.com/other/myapi.git');
+  const outAliased = buildContext(cfg(), aliasedRepo, { ok: true }, {}, { now });
+  assert.match(outAliased, /REMINDER: .*2026-10-01/);
+  const outOther = buildContext(cfg(), otherRepo, { ok: true }, {}, { now });
+  assert.ok(!outOther.includes('REMINDER:'), 'legacy alias save must not leak to another remote with same basename');
 });

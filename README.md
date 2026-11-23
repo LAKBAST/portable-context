@@ -166,6 +166,15 @@ You can override the character truncation limits per loaded file in `~/.pctx/con
 - `decision` (default `1500`): applies to autoloaded `decisions/<id>.md` (and legacy alias) files.
 - Each value must be a positive integer between `1` and `100000`. Truncated sections always keep the `[Truncated. Full file: <path>]` link to the full file. Integration-level hook limits (such as Codex's `additionalContextLimit`) are unchanged.
 
+### Stale-save reminder
+
+By default, `pctx hook` checks the calendar date in standard session filenames (`YYYY-MM-DD-HHmm-<project>-*.md`) across the visible repositories of the current project scope. When the most recent valid, non-future save for the project is at least `staleSaveDays` calendar days old (`ageDays >= staleSaveDays`, default `7`), the hook prints a `REMINDER:` line with the latest save date and age.
+
+- Set `"staleSaveDays": 0` in `~/.pctx/config.json` to disable the reminder (valid integers: `0` to `3650`).
+- Invalid filenames, invalid calendar dates, and future-dated files are ignored so they cannot hide an older save.
+- If no saved session exists yet for the project, no reminder is shown.
+- `pctx` never infers that the active session is unsaved and never saves automatically.
+
 ## Isolated teams and private destinations
 
 You can optionally isolate any team by binding it to exact remotes or explicit namespaces on any Git server, with an optional dedicated private repo (`privateDir`) completely separate from your personal context repo:
