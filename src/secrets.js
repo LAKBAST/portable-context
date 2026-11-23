@@ -7,6 +7,7 @@ const RULES = [
   ['stripe-key', /\b[sr]k_(?:live|test)_[A-Za-z0-9]{16,}/],
   ['slack-token', /\bxox[abeoprs]-[A-Za-z0-9-]{10,}/],
   ['google-api-key', /\bAIza[0-9A-Za-z_-]{35}/],
+  ['google-oauth-secret', /\bGOCSPX-[0-9A-Za-z_-]{20,}/],
   ['jwt', /\beyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}/],
   ['connection-string', /\b[a-z][a-z0-9+.-]*:\/\/[^\s:@/]*:[^\s@/]+@[^\s/]+/i],
 ];

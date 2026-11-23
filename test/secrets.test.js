@@ -13,6 +13,7 @@ const samples = {
   'anthropic key': 'sk-ant-' + 'api03-' + alnum(40),
   'openai key': 'sk-' + alnum(48),
   'google api key': 'AIza' + alnum(35),
+  'google oauth client secret': 'GOCSPX-' + alnum(28),
 };
 
 function diffWith(addedLine, file = 'notes.md') {
