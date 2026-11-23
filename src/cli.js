@@ -29,6 +29,7 @@ import {
   validatePrivateDestination,
 } from './context.js';
 import { install, removeSkill, status, uninstall } from './integrations.js';
+import { isPersonalDataRule } from './secrets.js';
 
 const DEFAULT_SKILL = 'save-context';
 
@@ -300,6 +301,9 @@ function runDoctor() {
   const aliasCount = Object.keys(config.aliases ?? {}).length;
   if (aliasCount) console.log(`Aliases: ${aliasCount}`);
   if (config.author) console.log(`Author: ${config.author}`);
+  if (Array.isArray(config.scanRules) && config.scanRules.length) {
+    console.log(`Scan rules (context): ${config.scanRules.join(', ')}`);
+  }
   try {
     validateConfig(config, git);
   } catch (err) {
@@ -315,6 +319,9 @@ function runDoctor() {
     console.log(
       `Team ${team.name}: ${redactUrl(team.url)} (${found ? team.dir : `missing clone at ${team.dir}`})${tagText}`,
     );
+    if (Array.isArray(team.scanRules) && team.scanRules.length) {
+      console.log(`Team ${team.name} scan rules: ${team.scanRules.join(', ')}`);
+    }
     if (team.privateDir) {
       let privState = 'ok';
       try {
@@ -323,6 +330,9 @@ function runDoctor() {
         privState = `invalid: ${err.message}`;
       }
       console.log(`Team ${team.name} private: ${team.privateDir} (${privState})`);
+      if (Array.isArray(team.privateScanRules) && team.privateScanRules.length) {
+        console.log(`Team ${team.name} private scan rules: ${team.privateScanRules.join(', ')}`);
+      }
     }
   }
   const state = (on) => (on ? 'installed' : 'missing');
@@ -466,21 +476,21 @@ function targetRepos(config, values) {
   if (resolved.conflict) throw new Error(resolved.conflict);
   if (resolved.scopeKind === 'isolated') {
     const team = resolved.isolatedTeam;
-    const list = [{ label: `team ${team.name}`, dir: team.dir, team }];
+    const list = [{ label: `team ${team.name}`, dir: team.dir, team, scanRules: team.scanRules }];
     if (team.privateDir) {
       const privDir = validatePrivateDestination(config, team, git);
-      list.push({ label: `private ${team.name}`, dir: privDir, privateOf: team });
+      list.push({ label: `private ${team.name}`, dir: privDir, privateOf: team, scanRules: team.privateScanRules });
     }
     return list;
   }
   if (values.team && resolved.team) {
-    return [{ label: `team ${resolved.team.name}`, dir: resolved.team.dir, team: resolved.team }];
+    return [{ label: `team ${resolved.team.name}`, dir: resolved.team.dir, team: resolved.team, scanRules: resolved.team.scanRules }];
   }
   return [
-    { label: 'context', dir: config.contextDir },
+    { label: 'context', dir: config.contextDir, scanRules: config.scanRules },
     ...teamList(config)
       .filter((t) => !t.isolated)
-      .map((team) => ({ label: `team ${team.name}`, dir: team.dir, team })),
+      .map((team) => ({ label: `team ${team.name}`, dir: team.dir, team, scanRules: team.scanRules })),
   ];
 }
 
@@ -491,7 +501,9 @@ function reportSync(result, prefix) {
     return 0;
   }
   if (result.status === 'blocked') {
-    console.error(`${prefix}blocked: possible secrets found, nothing was committed\n${formatFindings(result.findings)}`);
+    const hasPii = result.findings.some((f) => isPersonalDataRule(f.rule));
+    const kind = hasPii ? 'possible secrets or personal data' : 'possible secrets';
+    console.error(`${prefix}blocked: ${kind} found, nothing was committed\n${formatFindings(result.findings)}`);
     return 2;
   }
   console.error(`${prefix}${result.status}: ${result.message}`);
@@ -502,12 +514,12 @@ function runSync(values) {
   const config = requireConfig();
   const all = targetRepos(config, values);
   let code = 0;
-  for (const { label, dir, team, privateOf } of all) {
+  for (const { label, dir, team, privateOf, scanRules } of all) {
     const prefix = all.length > 1 ? `${label}: ` : '';
     const isolated = Boolean(team?.isolated || privateOf?.isolated);
     const message = values.message || (team ? `context: update from ${config.author ?? config.device}` : undefined);
     const result = existsSync(join(dir, '.git'))
-      ? sync(config, message, dir, { isolated })
+      ? sync(config, message, dir, { isolated, rules: scanRules })
       : { status: 'error', message: `no clone at ${dir}` };
     code = Math.max(code, reportSync(result, prefix));
   }
@@ -521,11 +533,11 @@ function runScan(values) {
   if (missing) throw new Error(`no clone at ${missing.dir}`);
   const all = targets.filter(({ dir }) => existsSync(join(dir, '.git')));
   let code = 0;
-  for (const { label, dir } of all) {
+  for (const { label, dir, scanRules } of all) {
     const prefix = all.length > 1 ? `${label}: ` : '';
     let findings;
     try {
-      findings = stagedFindings(dir);
+      findings = stagedFindings(dir, { rules: scanRules });
     } finally {
       git(dir, ['reset', '-q']);
     }

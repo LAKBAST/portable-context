@@ -8,6 +8,7 @@ import {
   isCanonicalProjectId,
   isInsideDir,
   localProjectId,
+  normalizeRealPath,
   parseRemote,
   redactText,
   redactUrl,
@@ -17,7 +18,7 @@ import {
   validateConfig,
   validatePrivateDestination,
 } from './identity.js';
-import { scanDiff } from './secrets.js';
+import { resolveScanRules, scanDiff } from './secrets.js';
 
 export {
   hasScopeRules,
@@ -1009,7 +1010,21 @@ export function sessionPath(config, project, now = new Date(), team = null, targ
   return join(targetDir ?? config.contextDir, 'sessions', `${date}-${time}-${proj}-${device}.md`);
 }
 
-export function stagedFindings(dir) {
+function repoScanRulesForDir(config, dir) {
+  if (!config || !dir) return [];
+  const target = normalizeRealPath(dir);
+  if (config.contextDir && normalizeRealPath(config.contextDir) === target) {
+    return config.scanRules ?? [];
+  }
+  for (const team of teamList(config)) {
+    if (team.dir && normalizeRealPath(team.dir) === target) return team.scanRules ?? [];
+    if (team.privateDir && normalizeRealPath(team.privateDir) === target) return team.privateScanRules ?? [];
+  }
+  return [];
+}
+
+export function stagedFindings(dir, { rules = [] } = {}) {
+  const resolvedRules = resolveScanRules(rules, 'scanRules');
   const add = git(dir, ['add', '-A']);
   if (!add.ok) throw new Error(`git add failed: ${redactText(firstLine(add.stderr))}`);
   // --text and the fixed prefixes keep user config and .gitattributes from hiding content from the scan.
@@ -1019,7 +1034,7 @@ export function stagedFindings(dir) {
     '--src-prefix=a/', '--dst-prefix=b/',
   ]);
   if (!diff.ok) throw new Error(`git diff failed: ${redactText(firstLine(diff.stderr))}`);
-  return scanDiff(diff.stdout);
+  return scanDiff(diff.stdout, { rules: resolvedRules });
 }
 
 function commitStaged(dir, message) {
@@ -1032,10 +1047,16 @@ function commitStaged(dir, message) {
   };
 }
 
-export function sync(config, message, dir = config.contextDir, { isolated = false } = {}) {
+export function sync(config, message, dir = config.contextDir, { isolated = false, rules } = {}) {
+  let resolvedRules;
+  try {
+    resolvedRules = resolveScanRules(rules !== undefined ? rules : repoScanRulesForDir(config, dir), 'scanRules');
+  } catch (err) {
+    return { status: 'error', message: err.message };
+  }
   let findings;
   try {
-    findings = stagedFindings(dir);
+    findings = stagedFindings(dir, { rules: resolvedRules });
   } catch (err) {
     return { status: 'error', message: err.message };
   }
