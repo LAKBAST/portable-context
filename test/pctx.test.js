@@ -1597,3 +1597,224 @@ test('invalid scanRules or privateScanRules fail before any commit or push runs'
     assert.equal(remoteHead(sb), remoteBefore, 'invalid config must prevent push');
   }
 });
+
+// ---------------------------------------------------------------- decisions index & autoload
+
+test('hook indexes decisions in current scope without leaking other teams or loading other bodies', () => {
+  const sb = makeSandbox();
+  const studioRemote = makeRemote(sb, 'studio-team');
+  const otherTeamRemote = makeRemote(sb, 'other-team');
+  const isolatedRemote = makeRemote(sb, 'isolated-team');
+  const alex = makeDevice(sb, 'alex-laptop', { antigravity: true });
+  setup(alex, sb, ['--author', 'alex']);
+  teamAdd(alex, 'studio', studioRemote);
+  teamAdd(alex, 'other', otherTeamRemote);
+  teamAdd(alex, 'corp', isolatedRemote, ['--isolated', '--namespace', 'git.corp.example/org']);
+
+  const studioDir = path.join(alex.pctxHome, 'teams', 'studio');
+  const otherDir = path.join(alex.pctxHome, 'teams', 'other');
+  const corpDir = path.join(alex.pctxHome, 'teams', 'corp');
+
+  assert.equal(pctx(alex, ['team', 'share', 'studio', '--project', 'alpha']).status, 0);
+  write(path.join(alex.context, 'decisions', 'alpha.md'), 'PERSONAL-ALPHA-DECISION-BODY\n');
+  write(path.join(alex.context, 'decisions', 'adr-001.md'), 'SECRET-OTHER-DECISION-BODY\n');
+  write(path.join(alex.context, 'decisions', 'alpha-notes.md'), 'PREFIX-NOT-AUTOLOADED\n');
+  write(path.join(alex.context, 'decisions', 'ignore.txt'), 'not markdown\n');
+  fs.mkdirSync(path.join(alex.context, 'decisions', 'dir.md'), { recursive: true });
+
+  write(path.join(studioDir, 'decisions', 'alpha.md'), 'STUDIO-ALPHA-DECISION-BODY\n');
+  write(path.join(studioDir, 'decisions', 'team-arch.md'), 'TEAM-ARCH-BODY-DO-NOT-LOAD\n');
+
+  write(path.join(otherDir, 'decisions', 'other-only.md'), 'OTHER-TEAM-DECISION\n');
+  write(path.join(corpDir, 'decisions', 'corp-only.md'), 'CORP-ISOLATED-DECISION\n');
+
+  const alphaRepo = projectDir(alex, 'alpha');
+  const h = hook(alex, alphaRepo);
+  assert.equal(h.status, 0, h.stderr);
+  const out = h.stdout;
+
+  // Current project decision autoloaded per repo without mixing sections.
+  assert.ok(out.includes('## Team studio decisions for alpha'), out);
+  assert.ok(out.includes('STUDIO-ALPHA-DECISION-BODY'));
+  assert.ok(out.includes('## Your private decisions for alpha'), out);
+  assert.ok(out.includes('PERSONAL-ALPHA-DECISION-BODY'));
+
+  // Other decision bodies must NOT load, while their names + native paths appear in the index.
+  assert.ok(!out.includes('SECRET-OTHER-DECISION-BODY'));
+  assert.ok(!out.includes('PREFIX-NOT-AUTOLOADED'));
+  assert.ok(!out.includes('TEAM-ARCH-BODY-DO-NOT-LOAD'));
+  assert.ok(!out.includes('other-only.md'));
+  assert.ok(!out.includes('corp-only.md'));
+
+  assert.ok(out.includes('## Decisions'), out);
+  assert.ok(out.includes(`- adr-001.md (personal: ${path.join(alex.context, 'decisions', 'adr-001.md')})`), out);
+  assert.ok(out.includes(`- alpha-notes.md (personal: ${path.join(alex.context, 'decisions', 'alpha-notes.md')})`), out);
+  assert.ok(out.includes(`- team-arch.md (team studio: ${path.join(studioDir, 'decisions', 'team-arch.md')})`), out);
+  assert.ok(!out.includes('ignore.txt'));
+  assert.ok(!out.includes('dir.md'));
+
+  // Antigravity format receives the same decisions index and autoloaded decision.
+  const ag = pctx(alex, ['hook', '--format', 'antigravity'], {
+    input: JSON.stringify({ workspacePaths: [alphaRepo] }),
+    cwd: alex.plugin,
+  });
+  assert.equal(ag.status, 0);
+  const agText = JSON.parse(ag.stdout).injectSteps[0].systemMessage.systemMessage;
+  assert.ok(agText.includes('## Decisions'));
+  assert.ok(agText.includes('STUDIO-ALPHA-DECISION-BODY'));
+});
+
+test('isolated team decisions index and autoload include shared and available private without personal leakage', () => {
+  const sb = makeSandbox();
+  const acmeRemote = makeRemote(sb, 'acme-team');
+  const acmePrivRemote = makeRemote(sb, 'acme-priv');
+  const alex = makeDevice(sb, 'alex-laptop');
+  setup(alex, sb, ['--author', 'alex', '--project-identity', 'remote']);
+  teamAdd(alex, 'acme', acmeRemote, [
+    '--isolated',
+    '--namespace', 'git.acme.example/platform',
+    '--private-url', acmePrivRemote,
+  ]);
+
+  const corpRepo = makeProjectRepo(alex, 'payments', 'https://git.acme.example/platform/payments.git');
+  const sess = pctx(alex, ['session-path', '--cwd', corpRepo]);
+  assert.equal(sess.status, 0);
+  const projectId = path.basename(sess.stdout.trim()).replace(/^\d{4}-\d{2}-\d{2}-\d{4}-/, '').replace(/-alex-alex-laptop\.md$/, '');
+
+  const acmeDir = path.join(alex.pctxHome, 'teams', 'acme');
+  const acmePrivDir = path.join(alex.pctxHome, 'teams', 'acme-private');
+
+  write(path.join(alex.context, 'decisions', `${projectId}.md`), 'PERSONAL-DECISION-MUST-NOT-LEAK\n');
+  write(path.join(alex.context, 'decisions', 'personal-only.md'), 'PERSONAL-ONLY\n');
+  write(path.join(acmeDir, 'decisions', `${projectId}.md`), 'ACME-SHARED-DECISION\n');
+  write(path.join(acmeDir, 'decisions', 'shared-rfc.md'), 'SHARED-RFC-BODY\n');
+  write(path.join(acmePrivDir, 'decisions', `${projectId}.md`), 'ACME-PRIV-DECISION\n');
+  write(path.join(acmePrivDir, 'decisions', 'priv-note.md'), 'PRIV-NOTE-BODY\n');
+
+  const h = hook(alex, corpRepo);
+  assert.equal(h.status, 0, h.stderr);
+  const out = h.stdout;
+  assert.ok(out.includes(`## Team acme decisions for ${projectId}`), out);
+  assert.ok(out.includes('ACME-SHARED-DECISION'));
+  assert.ok(out.includes(`## Your private decisions for ${projectId}`), out);
+  assert.ok(out.includes('ACME-PRIV-DECISION'));
+  assert.ok(out.includes(`- shared-rfc.md (team acme: ${path.join(acmeDir, 'decisions', 'shared-rfc.md')})`), out);
+  assert.ok(out.includes(`- priv-note.md (private acme: ${path.join(acmePrivDir, 'decisions', 'priv-note.md')})`), out);
+  assert.ok(!out.includes('SHARED-RFC-BODY'));
+  assert.ok(!out.includes('PRIV-NOTE-BODY'));
+  assert.ok(!out.includes('PERSONAL-DECISION-MUST-NOT-LEAK'));
+  assert.ok(!out.includes('personal-only.md'));
+
+  // When privateDir becomes unusable, shared decisions still load and private decisions are skipped.
+  fs.rmSync(acmePrivDir, { recursive: true, force: true });
+  const hNoPriv = hook(alex, corpRepo);
+  assert.equal(hNoPriv.status, 0);
+  assert.ok(hNoPriv.stdout.includes('ACME-SHARED-DECISION'));
+  assert.ok(!hNoPriv.stdout.includes('ACME-PRIV-DECISION'));
+  assert.ok(!hNoPriv.stdout.includes('priv-note.md'));
+});
+
+test('explicit migration aliases autoload decisions/<alias>.md only for declared remote, never by short basename', () => {
+  const sb = makeSandbox();
+  const alex = makeDevice(sb, 'alex-laptop');
+  setup(alex, sb, ['--project-identity', 'remote']);
+
+  write(path.join(alex.context, 'decisions', 'api.md'), 'LEGACY-API-DECISION-BODY\n');
+  assert.equal(pctx(alex, ['sync']).status, 0);
+
+  updateConfig(alex, (cfg) => {
+    cfg.aliases = { api: 'github.com/alex/api' };
+  });
+
+  const ownApi = makeProjectRepo(alex, 'alex-api', 'https://github.com/alex/api.git');
+  const otherApi = makeProjectRepo(alex, 'other-api', 'https://github.com/other-org/api.git');
+
+  const hOwn = hook(alex, ownApi);
+  assert.equal(hOwn.status, 0);
+  assert.ok(hOwn.stdout.includes('LEGACY-API-DECISION-BODY'), hOwn.stdout);
+  assert.ok(hOwn.stdout.includes('Loaded from declared alias'), hOwn.stdout);
+
+  const hOther = hook(alex, otherApi);
+  assert.equal(hOther.status, 0);
+  assert.ok(!hOther.stdout.includes('LEGACY-API-DECISION-BODY'), 'ambiguous short basename must not autoload decision');
+  assert.ok(hOther.stdout.includes(`- api.md (personal: ${path.join(alex.context, 'decisions', 'api.md')})`), hOther.stdout);
+});
+
+test('decisions index enforces stable ordering and budget bounds across many files', () => {
+  const sb = makeSandbox();
+  const studioRemote = makeRemote(sb, 'studio-team');
+  const alex = makeDevice(sb, 'alex-laptop');
+  setup(alex, sb, ['--author', 'alex']);
+  teamAdd(alex, 'studio', studioRemote);
+
+  assert.equal(pctx(alex, ['team', 'share', 'studio', '--project', 'alpha']).status, 0);
+  for (let i = 1; i <= 30; i++) {
+    const id = String(i).padStart(2, '0');
+    write(path.join(alex.context, 'decisions', `p-${id}-decision.md`), `body ${id}\n`);
+  }
+  const studioDir = path.join(alex.pctxHome, 'teams', 'studio');
+  write(path.join(studioDir, 'decisions', 'team-01.md'), 'team 1\n');
+  write(path.join(studioDir, 'decisions', 'team-02.md'), 'team 2\n');
+
+  const alphaRepo = projectDir(alex, 'alpha');
+  const h1 = hook(alex, alphaRepo);
+  const h2 = hook(alex, alphaRepo);
+  assert.equal(h1.status, 0);
+  assert.equal(h1.stdout, h2.stdout, 'decisions index order must be deterministic across runs');
+
+  const section = h1.stdout.split('## Decisions\n\n')[1].split('\n\n## ')[0];
+  assert.ok(section.includes('team-01.md'), 'round-robin should prevent personal repo from starving team repo');
+  assert.match(section, /\.\.\. \(\d+ more; browse /);
+  const bulletLines = section.split('\n').filter((l) => !l.startsWith('- ... ('));
+  assert.ok(bulletLines.length <= 20, `expected <= 20 entries, got ${bulletLines.length}`);
+  assert.ok(bulletLines.join('\n').length <= 1500, 'index entries must stay within character budget');
+});
+
+test('decisions never follow symlinks escaping the repository, including a symlinked decisions directory', () => {
+  const sb = makeSandbox();
+  const acmeRemote = makeRemote(sb, 'acme-team');
+  const alex = makeDevice(sb, 'alex-laptop');
+  setup(alex, sb, ['--author', 'alex', '--project-identity', 'remote']);
+  teamAdd(alex, 'acme', acmeRemote, ['--isolated', '--namespace', 'git.acme.example/platform']);
+
+  const corpRepo = makeProjectRepo(alex, 'payments', 'https://git.acme.example/platform/payments.git');
+  const sess = pctx(alex, ['session-path', '--cwd', corpRepo]);
+  const projectId = path.basename(sess.stdout.trim()).replace(/^\d{4}-\d{2}-\d{2}-\d{4}-/, '').replace(/-alex-alex-laptop\.md$/, '');
+  const acmeDir = path.join(alex.pctxHome, 'teams', 'acme');
+
+  write(path.join(alex.context, 'decisions', `${projectId}.md`), 'ESCAPED-PERSONAL-DECISION\n');
+  write(path.join(alex.context, 'decisions', 'secret-adr.md'), 'ESCAPED-ADR\n');
+
+  // 1) Whole decisions/ directory symlinked (or junctioned on Windows) to personal repo's decisions/.
+  fs.symlinkSync(
+    path.join(alex.context, 'decisions'),
+    path.join(acmeDir, 'decisions'),
+    process.platform === 'win32' ? 'junction' : 'dir',
+  );
+  const hDirLink = hook(alex, corpRepo);
+  assert.equal(hDirLink.status, 0);
+  assert.ok(!hDirLink.stdout.includes('ESCAPED-PERSONAL-DECISION'));
+  assert.ok(!hDirLink.stdout.includes('secret-adr.md'));
+
+  // 2) Real decisions/ directory containing symlinked files pointing outside acmeDir.
+  fs.rmSync(path.join(acmeDir, 'decisions'), { recursive: true, force: true });
+  fs.mkdirSync(path.join(acmeDir, 'decisions'), { recursive: true });
+  write(path.join(acmeDir, 'decisions', 'valid-in-repo.md'), 'VALID-BODY\n');
+  let createdFileLinks = true;
+  try {
+    fs.symlinkSync(path.join(alex.context, 'decisions', `${projectId}.md`), path.join(acmeDir, 'decisions', `${projectId}.md`));
+    fs.symlinkSync(path.join(alex.context, 'decisions', 'secret-adr.md'), path.join(acmeDir, 'decisions', 'secret-adr.md'));
+  } catch (err) {
+    if (process.platform === 'win32' && err.code === 'EPERM') createdFileLinks = false;
+    else throw err;
+  }
+
+  const hFileLink = hook(alex, corpRepo);
+  assert.equal(hFileLink.status, 0);
+  if (createdFileLinks) {
+    assert.ok(!hFileLink.stdout.includes('ESCAPED-PERSONAL-DECISION'));
+    assert.ok(!hFileLink.stdout.includes('secret-adr.md'));
+  }
+  assert.ok(hFileLink.stdout.includes('valid-in-repo.md'));
+  assert.ok(!hFileLink.stdout.includes('VALID-BODY'));
+});

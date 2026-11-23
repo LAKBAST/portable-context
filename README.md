@@ -5,7 +5,7 @@ Your agent memories do not travel. What Claude Code learned on your laptop is no
 ## How it works
 
 - Your context lives in a git repo that you own (profile, per-project notes, saved sessions). `pctx setup` clones it to `~/.pctx/context` by default.
-- A SessionStart hook runs `pctx hook`. It pulls the repo and prints the context into the new session: your profile (`AGENTS.md`), the notes for the current project, a list of other projects, and recent sessions for this project. By default (legacy mode), the project is identified by the basename of the `origin` remote of the working directory, or by the folder name when there is no remote; you can switch to host-and-full-path remote identity (`"projectIdentity": "remote"`) and configure isolated team scopes in `~/.pctx/config.json`.
+- A SessionStart hook runs `pctx hook`. It pulls the repo and prints the context into the new session: your profile (`AGENTS.md`), the notes for the current project, a bounded index of `decisions/` in the active scope, any project decision at `decisions/<project-id>.md`, a list of other projects, and recent sessions for this project. By default (legacy mode), the project is identified by the basename of the `origin` remote of the working directory, or by the folder name when there is no remote; you can switch to host-and-full-path remote identity (`"projectIdentity": "remote"`) and configure isolated team scopes in `~/.pctx/config.json`.
 - A skill (`save-context`) lets the agent write a session summary into the repo and run `pctx sync`, which commits and pushes.
 - If git cannot pull or push (offline, conflict), the hook still prints your local context, adds a `WARNING` line, and exits 0. Unpushed commits stay local and are pushed on a later sync or hook run.
 
@@ -137,7 +137,15 @@ In `"projectIdentity": "remote"` mode, `pctx` never guesses a project by basenam
 }
 ```
 
-With an explicit alias, only the declared remote reads the existing `projects/<alias>.md` notes and `sessions/*-<alias>-*.md` history while new sessions and notes are written under the new remote ID. Alternatively, you can rename `projects/<old>.md` directly to `projects/<new-id>.md` in your context repo and run `pctx sync`.
+With an explicit alias, only the declared remote reads the existing `projects/<alias>.md` notes, `decisions/<alias>.md` decision file, and `sessions/*-<alias>-*.md` history while new sessions, notes, and decisions are written under the new remote ID. Alternatively, you can rename `projects/<old>.md` and `decisions/<old>.md` directly to `<new-id>.md` in your context repo and run `pctx sync`.
+
+## Decisions index and project decisions
+
+When `decisions/*.md` files exist in the repositories of the current project scope (your personal repo and the current project's non-isolated team, or an isolated team's shared and available private repos):
+
+- **Bounded index**: `pctx hook` lists Markdown decision filenames together with their origin and navigable path under `## Decisions`, capped in stable order so the index never exceeds the context budget. Other decision files stay valid in the index without loading their bodies.
+- **Project decision autoload**: `decisions/<project-id>.md` (and `decisions/<alias>.md` when an explicit migration alias matches the current remote) is loaded automatically for the current project, separated per repository without mixing repos or guessing ambiguous short names.
+- **Symlink safety**: symlinks or junctions pointing outside the repository (including a `decisions/` directory linked to another scope) are ignored.
 
 ## Isolated teams and private destinations
 

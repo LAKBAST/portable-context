@@ -1,5 +1,5 @@
 import { spawnSync } from 'node:child_process';
-import { cpSync, existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { cpSync, existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -43,6 +43,9 @@ const SYNC_PUSH_TIMEOUT = 60_000;
 const CLONE_TIMEOUT = 120_000;
 const PROFILE_MAX = 3000;
 const PROJECT_MAX = 4000;
+const DECISION_MAX = 1500;
+const DECISIONS_INDEX_MAX_ITEMS = 20;
+const DECISIONS_INDEX_MAX_CHARS = 1500;
 const RECENT_SESSIONS = 3;
 
 export function configDir() {
@@ -833,51 +836,159 @@ function listSection(title, names) {
   return names.length ? [`## ${title}\n\n${names.map((name) => `- ${name}`).join('\n')}`] : [];
 }
 
+function resolveSafeSubdir(repoDir, subdir) {
+  if (!repoDir) return null;
+  const dir = join(repoDir, subdir);
+  if (!existsSync(dir)) return null;
+  try {
+    if (!statSync(dir).isDirectory()) return null;
+  } catch {
+    return null;
+  }
+  if (!isInsideDir(dir, repoDir)) return null;
+  if (normalizeRealPath(dir) === normalizeRealPath(repoDir)) return null;
+  return dir;
+}
+
+function isSafeRepoFile(repoDir, file) {
+  if (!existsSync(file)) return false;
+  try {
+    if (!statSync(file).isFile()) return false;
+  } catch {
+    return false;
+  }
+  return isInsideDir(file, repoDir);
+}
+
+function safeDecisionFiles(repoDir) {
+  const dir = resolveSafeSubdir(repoDir, 'decisions');
+  if (!dir) return { dir: null, files: [] };
+  const files = readdirSync(dir)
+    .filter((name) => name.endsWith('.md') && isSafeRepoFile(repoDir, join(dir, name)))
+    .sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+  return { dir, files };
+}
+
+function decisionsIndexSection(repos) {
+  const buckets = [];
+  let total = 0;
+  for (const repo of repos) {
+    const { dir: decisionsDir, files } = safeDecisionFiles(repo.dir);
+    if (!files.length) continue;
+    buckets.push({
+      label: repo.label,
+      decisionsDir,
+      items: files.map((name) => ({
+        name,
+        line: `- ${name} (${repo.label}: ${join(decisionsDir, name)})`,
+      })),
+    });
+    total += files.length;
+  }
+  if (!total) return [];
+
+  // Round-robin across repos within both item and character budgets so one repo cannot starve another.
+  const selectedByBucket = buckets.map(() => []);
+  let selectedCount = 0;
+  let usedChars = 0;
+  let cursor = 0;
+  let budgetFull = false;
+  while (!budgetFull && selectedCount < DECISIONS_INDEX_MAX_ITEMS && selectedCount < total) {
+    let addedInRound = false;
+    for (let i = 0; i < buckets.length && selectedCount < DECISIONS_INDEX_MAX_ITEMS; i++) {
+      if (cursor >= buckets[i].items.length) continue;
+      const item = buckets[i].items[cursor];
+      const nextChars = usedChars + (selectedCount ? 1 : 0) + item.line.length;
+      if (selectedCount > 0 && nextChars > DECISIONS_INDEX_MAX_CHARS) {
+        budgetFull = true;
+        break;
+      }
+      selectedByBucket[i].push(item);
+      selectedCount += 1;
+      usedChars = nextChars;
+      addedInRound = true;
+    }
+    if (!addedInRound) break;
+    cursor += 1;
+  }
+
+  const lines = selectedByBucket.flatMap((items) => items.map((item) => item.line));
+  const omittedDirs = [];
+  let omitted = 0;
+  for (let i = 0; i < buckets.length; i++) {
+    const missing = buckets[i].items.length - selectedByBucket[i].length;
+    if (missing > 0) {
+      omitted += missing;
+      omittedDirs.push(buckets[i].decisionsDir);
+    }
+  }
+  if (omitted > 0) {
+    lines.push(`- ... (${omitted} more; browse ${omittedDirs.join(', ')})`);
+  }
+  return [`## Decisions\n\n${lines.join('\n')}`];
+}
+
+function readScopedMarkdown(dir, subdir, projectId, alias, { checkInside = false } = {}) {
+  const baseDir = checkInside ? resolveSafeSubdir(dir, subdir) : join(dir, subdir);
+  if (!baseDir) {
+    return {
+      primaryFile: join(dir, subdir, `${projectId}.md`),
+      primaryText: null,
+      aliasFile: null,
+      aliasText: null,
+    };
+  }
+  const primaryFile = join(baseDir, `${projectId}.md`);
+  const primaryText = !checkInside || isSafeRepoFile(dir, primaryFile) ? readIfExists(primaryFile) : null;
+  const aliasFile = alias && alias !== projectId ? join(baseDir, `${alias}.md`) : null;
+  const aliasText = aliasFile && (!checkInside || isSafeRepoFile(dir, aliasFile)) ? readIfExists(aliasFile) : null;
+  return { primaryFile, primaryText, aliasFile, aliasText };
+}
+
+function formatScopedBody({ primaryFile, primaryText, aliasFile, aliasText }, maxChars, label, emptyText = null) {
+  if (primaryText && aliasText) {
+    return `${truncate(primaryText, maxChars, primaryFile)}\n\n### Legacy alias ${label} (${aliasFile})\n\n${truncate(aliasText, maxChars, aliasFile)}`;
+  }
+  if (primaryText) return truncate(primaryText, maxChars, primaryFile);
+  if (aliasText) {
+    return `(Loaded from declared alias ${aliasFile}; new ${label} use ${primaryFile}.)\n\n${truncate(aliasText, maxChars, aliasFile)}`;
+  }
+  return emptyText;
+}
+
+function projectDecisionSections(repos, projectId, alias, decisionMax = DECISION_MAX) {
+  if (!projectId) return [];
+  const sections = [];
+  for (const repo of repos) {
+    const data = readScopedMarkdown(repo.dir, 'decisions', projectId, alias, { checkInside: true });
+    const body = formatScopedBody(data, decisionMax, 'decisions');
+    if (body) sections.push(`## ${repo.heading}\n\n${body}`);
+  }
+  return sections;
+}
+
 function profileSection(dir, heading = 'Profile') {
   const file = join(dir, 'AGENTS.md');
   const text = readIfExists(file);
   return text ? [`## ${heading}\n\n${truncate(text, PROFILE_MAX, file)}`] : [];
 }
 
-function readProjectNotes(dir, projectId, alias) {
-  const primaryFile = join(dir, 'projects', `${projectId}.md`);
-  const primaryText = readIfExists(primaryFile);
-  const aliasFile = alias ? join(dir, 'projects', `${alias}.md`) : null;
-  const aliasText = aliasFile ? readIfExists(aliasFile) : null;
-  return { primaryFile, primaryText, aliasFile, aliasText };
-}
-
-function formatPersonalNotesBody(dir, projectId, alias) {
-  const { primaryFile, primaryText, aliasFile, aliasText } = readProjectNotes(dir, projectId, alias);
-  if (primaryText && aliasText) {
-    return `${truncate(primaryText, PROJECT_MAX, primaryFile)}\n\n### Legacy alias notes (${aliasFile})\n\n${truncate(aliasText, PROJECT_MAX, aliasFile)}`;
-  }
-  if (primaryText) return truncate(primaryText, PROJECT_MAX, primaryFile);
-  if (aliasText) {
-    return `(Loaded from declared alias ${aliasFile}; new notes use ${primaryFile}.)\n\n${truncate(aliasText, PROJECT_MAX, aliasFile)}`;
-  }
-  return `No notes yet (${primaryFile}).`;
-}
-
 function projectSection(dir, projectId, display, alias) {
   if (!projectId) return [];
   const header = `## Current project: ${projectId}`;
   const remoteLine = display && display !== projectId ? `Remote: ${display}\n\n` : '';
-  const body = formatPersonalNotesBody(dir, projectId, alias);
+  const data = readScopedMarkdown(dir, 'projects', projectId, alias);
+  const body = formatScopedBody(data, PROJECT_MAX, 'notes', `No notes yet (${data.primaryFile}).`);
   return [`${header}\n\n${remoteLine}${body}`];
 }
 
 function teamProjectSections(privateDir, team, projectId, display, alias, { includePrivate = true } = {}) {
-  const { primaryFile, primaryText, aliasFile, aliasText } = readProjectNotes(team.dir, projectId, alias);
+  const data = readScopedMarkdown(team.dir, 'projects', projectId, alias);
   const sections = [];
   const teamProfile = readIfExists(join(team.dir, 'AGENTS.md'));
   if (teamProfile) sections.push(`## Team ${team.name}\n\n${truncate(teamProfile, PROFILE_MAX, join(team.dir, 'AGENTS.md'))}`);
   const remoteLine = display && display !== projectId ? `Remote: ${display}\n\n` : '';
-  let body;
-  if (primaryText) body = truncate(primaryText, PROJECT_MAX, primaryFile);
-  else if (aliasText) {
-    body = `(Loaded from declared alias ${aliasFile}; new notes use ${primaryFile}.)\n\n${truncate(aliasText, PROJECT_MAX, aliasFile)}`;
-  } else body = `No notes yet (${primaryFile}).`;
+  const body = formatScopedBody(data, PROJECT_MAX, 'notes', `No notes yet (${data.primaryFile}).`);
   sections.push(
     `## Current project: ${projectId} (shared in team ${team.name})\n\n` +
       remoteLine +
@@ -885,12 +996,9 @@ function teamProjectSections(privateDir, team, projectId, display, alias, { incl
       body,
   );
   if (includePrivate && privateDir) {
-    const priv = readProjectNotes(privateDir, projectId, alias);
-    const privText = priv.primaryText ?? priv.aliasText;
-    const privFile = priv.primaryText ? priv.primaryFile : priv.aliasFile;
-    if (privText) {
-      sections.push(`## Your private notes for ${projectId}\n\n${truncate(privText, PROJECT_MAX, privFile)}`);
-    }
+    const priv = readScopedMarkdown(privateDir, 'projects', projectId, alias);
+    const privBody = formatScopedBody(priv, PROJECT_MAX, 'notes');
+    if (privBody) sections.push(`## Your private notes for ${projectId}\n\n${privBody}`);
   }
   return sections;
 }
@@ -935,6 +1043,12 @@ function buildIsolatedContext(team, resolved, teamResults, privateResult) {
   }
   const teamSessions = recentSessions(team.dir, projectId, resolved.alias);
   const privateSessions = privateUsable ? recentSessions(team.privateDir, projectId, resolved.alias) : [];
+  const decisionRepos = [
+    { label: `team ${team.name}`, dir: team.dir, heading: `Team ${team.name} decisions for ${projectId}` },
+    ...(privateUsable
+      ? [{ label: `private ${team.name}`, dir: team.privateDir, heading: `Your private decisions for ${projectId}` }]
+      : []),
+  ];
   return [
     `# Portable context (team ${team.name})`,
     `Team repo: ${team.dir}`,
@@ -945,7 +1059,9 @@ function buildIsolatedContext(team, resolved, teamResults, privateResult) {
     ...teamProjectSections(team.privateDir, team, projectId, resolved.display, resolved.alias, {
       includePrivate: privateUsable,
     }),
+    ...projectDecisionSections(decisionRepos, projectId, resolved.alias),
     ...listSection('Other projects', others),
+    ...decisionsIndexSection(decisionRepos),
     ...listSection(`Recent team sessions for this project (${join(team.dir, 'sessions')})`, teamSessions),
     ...(privateUsable
       ? listSection(`Recent private sessions for this project (${join(team.privateDir, 'sessions')})`, privateSessions)
@@ -978,6 +1094,16 @@ export function buildContext(config, cwd, syncResult, teamResults = {}, extra = 
     ? [`Team repos: ${nonIsolatedTeams.map((t) => `${t.name} (${t.dir})`).join(', ')}`]
     : [];
   const teamSessions = team ? recentSessions(team.dir, projectId, resolved.alias) : [];
+  const decisionIndexRepos = [
+    { label: 'personal', dir },
+    ...(team ? [{ label: `team ${team.name}`, dir: team.dir }] : []),
+  ];
+  const decisionAutoloadRepos = team
+    ? [
+        { dir: team.dir, heading: `Team ${team.name} decisions for ${projectId}` },
+        { dir, heading: `Your private decisions for ${projectId}` },
+      ]
+    : [{ dir, heading: `Project decisions: ${projectId}` }];
   return [
     '# Portable context',
     `Context repo: ${dir}`,
@@ -989,7 +1115,9 @@ export function buildContext(config, cwd, syncResult, teamResults = {}, extra = 
     ...(team
       ? teamProjectSections(dir, team, projectId, resolved.display, resolved.alias)
       : projectSection(dir, projectId, resolved.display, resolved.alias)),
+    ...projectDecisionSections(decisionAutoloadRepos, projectId, resolved.alias),
     ...listSection('Other projects', others),
+    ...decisionsIndexSection(decisionIndexRepos),
     ...listSection('Recent sessions for this project', recentSessions(dir, projectId, resolved.alias)),
     ...listSection(`Recent team sessions for this project (${join(team?.dir ?? '', 'sessions')})`, teamSessions),
   ].join('\n\n');
