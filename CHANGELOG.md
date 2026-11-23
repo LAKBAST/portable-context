@@ -2,6 +2,24 @@
 
 All notable changes to this project are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses [Semantic Versioning](https://semver.org/).
 
+## [0.6.0] - 2026-11-23
+
+### Added
+
+- Opt-in project identity by Git host and full repository path. Explicit migration aliases let existing projects retain their notes and session history.
+- Opt-in team isolation by Git remote or namespace, with an optional dedicated private repository. Context loading, saving, and synchronization respect the active scope. Private saves require a configured destination for isolated teams.
+- Opt-in scanning of Spanish DNI, NIE, IBAN, and mobile numbers, configurable separately for each context repository. Google OAuth client secrets are checked by the global credential scanner.
+- A scoped decisions index, automatic loading of the current project's decision, and configurable character limits for profiles, project notes, and decisions.
+- A configurable reminder when the last saved session for a project is at least seven calendar days old by default.
+
+### Changed
+
+- SessionStart reuses a successful refresh for up to 120 seconds by default. Failed refreshes are retried. Compact hooks read the local context without pulling or pushing, and manual `pctx sync` remains independent of the interval.
+
+### Fixed
+
+- Test discovery works on Windows with Node 20 and newer.
+
 ## [0.5.0] - 2026-11-18
 
 ### Added
@@ -50,6 +68,8 @@ All notable changes to this project are documented here. The format follows [Kee
 
 - First release: one private git repo of markdown context loaded into Claude Code and Codex through a SessionStart hook, with a save skill, `setup`, `install`, `uninstall`, `doctor`, `session-path`, `sync` and `scan` commands, and secret scanning before each commit.
 
+[0.6.0]: https://github.com/LAKBAST/portable-context/releases/tag/v0.6.0
+[0.5.0]: https://github.com/LAKBAST/portable-context/releases/tag/v0.5.0
 [0.4.0]: https://github.com/LAKBAST/portable-context/releases/tag/v0.4.0
 [0.3.0]: https://github.com/LAKBAST/portable-context/releases/tag/v0.3.0
 [0.2.0]: https://github.com/LAKBAST/portable-context/releases/tag/v0.2.0
