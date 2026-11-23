@@ -234,7 +234,7 @@ Reply to the user in their language. If the user asked to share the project with
 6. Never write credentials or personal data about others; refer to people by name.
 7. Compare the new \`## Working style\` with the same section in earlier sessions of the same private repo and with that repo's profile (\`AGENTS.md\` and any file it points to). In an isolated team scope, never compare \`## Working style\` with the personal context repo or transfer observations or profile edits to the personal \`AGENTS.md\`; only compare and propose edits within that isolated team's dedicated private repo (if one is configured). If a pattern repeats in two or more sessions and that profile does not say it yet, or contradicts it, propose to the user the exact line to add or change, in one or two lines. Change the profile only if they agree.
 8. Run \`${cli} sync --cwd .\`. It scans, commits, pulls, and pushes only the active scope (the context repo and non-isolated teams for personal projects, or the isolated team and its private repo for an isolated project); with multiple repos, each line starts with the repo it is about.
-   - \`blocked\`: remove the secret at the listed file:line, or ask the user if it is a false positive. Never bypass the check.
+   - \`blocked\`: remove the credential or personal data at the listed file:line, or ask the user if it is a false positive. Never bypass the check.
    - \`local-only\`: the save is committed on this device but has not reached the remote. Tell the user.
 9. Tell the user in one or two lines what went where (for example "saved to team acme; 2 private notes in your private acme repo", or note if no private destination was configured) and whether it reached the remote.
 `;
