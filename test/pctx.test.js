@@ -1291,6 +1291,9 @@ test('save skill isolates Working style and handles missing private destination;
   const skill = fs.readFileSync(path.join(a.claude, 'skills', 'save-context', 'SKILL.md'), 'utf8');
   assert.match(skill, /never compare `## Working style` with the personal context repo/i);
   assert.match(skill, /if `--private` fails because no private destination is configured/i);
+  assert.match(skill, /Only for a non-isolated \(legacy\) team/i);
+  assert.match(skill, /never read or migrate notes from the personal context repo/i);
+  assert.match(skill, /--private` \(reusing the same `--project <name>` if you used it in step 1\)/);
 
   const token = 's3cr3t_team_tok';
   const r = pctx(a, ['team', 'add', 'acme', `https://bot:${token}@git.acme.example/team.git`]);
