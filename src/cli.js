@@ -11,10 +11,11 @@ import {
   git,
   hasScopeRules,
   hookDeadline,
+  hookRefresh,
   loadConfig,
   parseRemote,
   redactUrl,
-  refresh,
+  resolveHookRefreshSeconds,
   resolveScope,
   saveConfig,
   sessionPath,
@@ -352,7 +353,7 @@ function readHookInput() {
   try {
     if (process.stdin.isTTY) return {};
     const input = JSON.parse(readFileSync(0, 'utf8').replace(/^﻿/, ''));
-    return input && typeof input === 'object' ? input : {};
+    return input && typeof input === 'object' && !Array.isArray(input) ? input : {};
   } catch {
     return {};
   }
@@ -385,20 +386,23 @@ function runHook(args) {
     const config = loadConfig();
     if (config) {
       const deadline = hookDeadline();
-      const workDir = hookWorkDir(readHookInput(), antigravity);
+      const input = readHookInput();
+      const workDir = hookWorkDir(input, antigravity);
+      const compact = input.source === 'compact';
       const resolved = resolveScope(config, { cwd: workDir, allowConflict: true });
+      const refreshOpts = { compact, intervalSeconds: resolveHookRefreshSeconds(config) };
 
       if (resolved.scopeKind === 'isolated' && resolved.isolatedTeam && !resolved.conflict) {
         const team = resolved.isolatedTeam;
         const teamResults = {};
         teamResults[team.name] = existsSync(join(team.dir, '.git'))
-          ? refresh(team.dir, deadline, { isolated: true })
+          ? hookRefresh(team.dir, deadline, { ...refreshOpts, isolated: true })
           : { ok: false, message: `no clone at ${team.dir}; run pctx team add again` };
         let privateResult = null;
         if (team.privateDir) {
           try {
             validatePrivateDestination(config, team, git);
-            privateResult = refresh(team.privateDir, deadline, { isolated: true });
+            privateResult = hookRefresh(team.privateDir, deadline, { ...refreshOpts, isolated: true });
           } catch (err) {
             privateResult = { ok: false, unusable: true, message: err.message };
           }
@@ -407,7 +411,7 @@ function runHook(args) {
       } else if (resolved.conflict && (resolved.scopeKind === 'isolated' || resolved.isolatedTeam)) {
         text = `Portable context unavailable: ${resolved.conflict}`;
       } else {
-        const personal = refresh(config.contextDir, deadline);
+        const personal = hookRefresh(config.contextDir, deadline, refreshOpts);
         // Personal hook never enumerates, refreshes, or pushes isolated teams.
         const nonIsolated = teamList(config).filter((t) => !t.isolated);
         const teams = [...nonIsolated].sort(
@@ -416,7 +420,7 @@ function runHook(args) {
         const teamResults = {};
         for (const team of teams) {
           teamResults[team.name] = existsSync(join(team.dir, '.git'))
-            ? refresh(team.dir, deadline)
+            ? hookRefresh(team.dir, deadline, refreshOpts)
             : { ok: false, message: `no clone at ${team.dir}; run pctx team add again` };
         }
         text = buildContext(config, workDir, personal, teamResults, { resolved });

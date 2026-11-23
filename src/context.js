@@ -1,9 +1,11 @@
+import { createHash, randomBytes } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
-import { cpSync, existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { cpSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
+  DEFAULT_HOOK_REFRESH_SECONDS,
   DEFAULT_LIMITS,
   DEFAULT_STALE_SAVE_DAYS,
   hasScopeRules,
@@ -15,6 +17,7 @@ import {
   redactText,
   redactUrl,
   remoteProjectId,
+  resolveHookRefreshSeconds,
   resolveLimits,
   resolveStaleSaveDays,
   slug,
@@ -30,6 +33,7 @@ export {
   redactText,
   redactUrl,
   remoteProjectId,
+  resolveHookRefreshSeconds,
   slug,
   validateConfig,
   validatePrivateDestination,
@@ -224,6 +228,65 @@ export function refresh(dir, deadline = Infinity, { isolated = false } = {}) {
 
 export function hookDeadline(start = Date.now()) {
   return start + HOOK_BUDGET;
+}
+
+function refreshCacheKey(dir) {
+  const realDir = normalizeRealPath(dir);
+  const originRes = git(dir, ['config', '--get', 'remote.origin.url']);
+  const origin = originRes.ok ? originRes.stdout.trim() : '';
+  return createHash('sha256').update(`${realDir}\0${origin}`).digest('hex');
+}
+
+function refreshCacheFile(dir) {
+  return join(configDir(), 'hook-refresh', `${refreshCacheKey(dir)}.json`);
+}
+
+function isRefreshFresh(dir, intervalSeconds, nowMs = Date.now()) {
+  if (intervalSeconds <= 0) return false;
+  try {
+    const file = refreshCacheFile(dir);
+    if (!existsSync(file)) return false;
+    const data = JSON.parse(readFileSync(file, 'utf8'));
+    const ts = data?.refreshedAt;
+    if (typeof ts !== 'number' || !Number.isFinite(ts) || ts <= 0) return false;
+    const ageMs = nowMs - ts;
+    return ageMs >= 0 && ageMs < intervalSeconds * 1000;
+  } catch {
+    return false;
+  }
+}
+
+function writeRefreshTimestamp(dir, nowMs = Date.now()) {
+  if (!Number.isFinite(nowMs) || nowMs <= 0) return;
+  try {
+    const file = refreshCacheFile(dir);
+    mkdirSync(dirname(file), { recursive: true });
+    const tmp = `${file}.tmp-${process.pid}-${randomBytes(4).toString('hex')}`;
+    try {
+      writeFileSync(tmp, `${JSON.stringify({ refreshedAt: nowMs })}\n`);
+      renameSync(tmp, file);
+    } finally {
+      rmSync(tmp, { force: true });
+    }
+  } catch {
+    // Cache read/write errors must never block the session hook.
+  }
+}
+
+// Reuses `refresh` while enforcing `compact` local-only mode and the per-clone `hookRefreshSeconds` interval.
+export function hookRefresh(
+  dir,
+  deadline = Infinity,
+  { isolated = false, compact = false, intervalSeconds = DEFAULT_HOOK_REFRESH_SECONDS, now } = {},
+) {
+  if (compact) return { ok: true, skipped: true };
+  const checkNow = now ?? Date.now();
+  if (intervalSeconds > 0 && existsSync(join(dir, '.git')) && isRefreshFresh(dir, intervalSeconds, checkNow)) {
+    return { ok: true, skipped: true };
+  }
+  const result = refresh(dir, deadline, { isolated });
+  if (result.ok) writeRefreshTimestamp(dir, now ?? Date.now());
+  return result;
 }
 
 // ---------------------------------------------------------------- teams & scope
