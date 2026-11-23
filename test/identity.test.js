@@ -12,6 +12,7 @@ import {
   redactUrl,
   remoteProjectId,
   localProjectId,
+  validateConfig,
 } from '../src/identity.js';
 
 const tmpDirs = [];
@@ -163,4 +164,44 @@ test('pathsOverlap detects symlinks, trailing slashes, and nested directories', 
   assert.ok(pathsOverlap(`${realDir}/`, linkDir));
   assert.ok(pathsOverlap(realDir, path.join(linkDir, 'nested', 'priv')));
   assert.ok(!pathsOverlap(realDir, path.join(root, 'other-dir')));
+});
+
+test('validateConfig checks per-repo scanRules and privateScanRules', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'pctx-cfg-test-'));
+  tmpDirs.push(root);
+  const validCfg = {
+    contextDir: path.join(root, 'ctx'),
+    scanRules: ['es-dni', 'es-iban'],
+    teams: [
+      {
+        name: 'acme',
+        dir: path.join(root, 'acme'),
+        isolated: true,
+        namespaces: ['git.acme.example/platform'],
+        privateDir: path.join(root, 'acme-priv'),
+        scanRules: ['es-pii'],
+        privateScanRules: ['es-mobile'],
+      },
+    ],
+  };
+  assert.doesNotThrow(() => validateConfig(validCfg));
+
+  assert.throws(() => validateConfig({ ...validCfg, scanRules: ['bogus-rule'] }), /Unknown rule/);
+  assert.throws(() => validateConfig({ ...validCfg, scanRules: 'es-pii' }), /must be an array/);
+  assert.throws(
+    () =>
+      validateConfig({
+        ...validCfg,
+        teams: [{ ...validCfg.teams[0], scanRules: ['es-bad'] }],
+      }),
+    /Unknown rule/,
+  );
+  assert.throws(
+    () =>
+      validateConfig({
+        ...validCfg,
+        teams: [{ ...validCfg.teams[0], privateDir: undefined, privateScanRules: ['es-dni'] }],
+      }),
+    /without privateDir/,
+  );
 });

@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import { existsSync, realpathSync } from 'node:fs';
 import { dirname, isAbsolute, posix, resolve } from 'node:path';
+import { resolveScanRules } from './secrets.js';
 
 const SAFE_STEM = /^[a-zA-Z0-9._-]+$/;
 const DOMAIN_HOST = /^(?:localhost|\[[0-9a-fA-F:]+\]|[a-zA-Z0-9-]+(?:\.[a-zA-Z0-9-]+)+)$/;
@@ -481,6 +482,7 @@ export function validateConfig(config, gitFn = null) {
   if (mode !== 'legacy' && mode !== 'remote') {
     throw new Error(`Invalid projectIdentity "${mode}" in config.json (expected "legacy" or "remote")`);
   }
+  resolveScanRules(config.scanRules, 'scanRules in config.json');
   const teams = Array.isArray(config.teams) ? config.teams : [];
   const seenNames = new Set();
   for (const team of teams) {
@@ -528,6 +530,13 @@ export function validateConfig(config, gitFn = null) {
       }
     } else if (team.privateDir !== undefined && team.privateDir !== null) {
       throw new Error(`Team ${team.name} sets privateDir without isolated: true`);
+    }
+    resolveScanRules(team.scanRules, `teams[${team.name}].scanRules`);
+    if (team.privateScanRules !== undefined) {
+      if (!team.isolated || !team.privateDir) {
+        throw new Error(`Team ${team.name} sets privateScanRules without privateDir`);
+      }
+      resolveScanRules(team.privateScanRules, `teams[${team.name}].privateScanRules`);
     }
   }
 

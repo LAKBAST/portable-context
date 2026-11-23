@@ -1433,3 +1433,167 @@ test('isolated push destination validation blocks pushurl/pushRemote leaks and p
   assert.equal(remoteHead(sb), persHeadBefore);
   assert.notEqual(git(['--git-dir', rogueRemote, 'rev-parse', 'main'], { allowFail: true }).status, 0);
 });
+
+// ---------------------------------------------------------------- configurable personal data scanning
+
+test('migration without opt-in keeps personal data unblocked while GOCSPX- is blocked globally', () => {
+  const sb = makeSandbox();
+  const a = makeDevice(sb, 'laptop');
+  setup(a, sb);
+
+  const syntheticDni = '00000001R';
+  const syntheticIban = 'ES8200000000000000000000';
+  write(
+    path.join(a.context, 'projects', 'notes.md'),
+    `Synthetic samples: ${syntheticDni} ${syntheticIban} +34 600 000 000\n`,
+  );
+  assert.equal(pctx(a, ['scan']).status, 0);
+  const okSync = pctx(a, ['sync']);
+  assert.equal(okSync.status, 0, okSync.stderr);
+  assert.match(okSync.stdout, /synced/);
+
+  const oauthSecret = 'GOCSPX-' + 'aB3dE5gH7j'.repeat(3).slice(0, 28);
+  const headBefore = localHead(a);
+  const remoteBefore = remoteHead(sb);
+  write(path.join(a.context, 'projects', 'oauth.md'), `client_secret=${oauthSecret}\n`);
+  const blockedScan = pctx(a, ['scan']);
+  assert.equal(blockedScan.status, 2);
+  assert.match(blockedScan.stdout, /oauth\.md:1 \(google-oauth-secret\)/);
+  assert.ok(!blockedScan.stdout.includes(oauthSecret));
+
+  const blockedSync = pctx(a, ['sync']);
+  assert.equal(blockedSync.status, 2);
+  assert.match(blockedSync.stderr, /oauth\.md:1 \(google-oauth-secret\)/);
+  assert.ok(!blockedSync.stderr.includes(oauthSecret));
+  assert.equal(localHead(a), headBefore);
+  assert.equal(remoteHead(sb), remoteBefore);
+});
+
+test('per-repo scanRules and privateScanRules block independently across personal, team, and isolated private repos', () => {
+  const sb = makeSandbox();
+  const studioRemote = makeRemote(sb, 'studio-team');
+  const acmeRemote = makeRemote(sb, 'acme-team');
+  const acmePrivRemote = makeRemote(sb, 'acme-priv');
+  const alex = makeDevice(sb, 'alex-laptop');
+  setup(alex, sb, ['--author', 'alex', '--project-identity', 'remote']);
+  teamAdd(alex, 'studio', studioRemote);
+  teamAdd(alex, 'acme', acmeRemote, [
+    '--isolated',
+    '--namespace', 'git.acme.example/platform',
+    '--private-url', acmePrivRemote,
+  ]);
+
+  updateConfig(alex, (cfg) => {
+    cfg.scanRules = ['es-dni'];
+    cfg.teams.find((t) => t.name === 'studio').scanRules = ['es-iban'];
+    const acme = cfg.teams.find((t) => t.name === 'acme');
+    acme.scanRules = ['es-pii'];
+    acme.privateScanRules = ['es-mobile'];
+  });
+
+  const doc = pctx(alex, ['doctor']);
+  assert.equal(doc.status, 0);
+  assert.match(doc.stdout, /Scan rules \(context\): es-dni/);
+  assert.match(doc.stdout, /Team acme scan rules: es-pii/);
+  assert.match(doc.stdout, /Team acme private scan rules: es-mobile/);
+
+  const studioDir = path.join(alex.pctxHome, 'teams', 'studio');
+  const acmeDir = path.join(alex.pctxHome, 'teams', 'acme');
+  const acmePrivDir = path.join(alex.pctxHome, 'teams', 'acme-private');
+  const corpRepo = makeProjectRepo(alex, 'payments', 'https://git.acme.example/platform/payments.git');
+
+  const dni = '00000001R';
+  const iban = 'ES55 0000 0000 0000 0000 0001';
+  const mobile = '+34 600 000 000';
+
+  // 1) Personal + non-isolated scope: personal blocks DNI (allows IBAN), studio blocks IBAN (allows DNI).
+  write(path.join(alex.context, 'projects', 'personal-ok.md'), `IBAN allowed here: ${iban}\n`);
+  write(path.join(alex.context, 'projects', 'personal-dni.md'), `line1\nDNI: ${dni}\n`);
+  write(path.join(studioDir, 'projects', 'studio-dni-ok.md'), `DNI allowed in studio: ${dni}\n`);
+  write(path.join(studioDir, 'projects', 'studio-iban.md'), `IBAN blocked in studio: ${iban}\n`);
+
+  const persHeadBefore = remoteHead(sb);
+  const studioHeadBefore = git(['--git-dir', studioRemote, 'rev-parse', 'main']).stdout.trim();
+  const scanPers = pctx(alex, ['scan', '--cwd', alex.work]);
+  assert.equal(scanPers.status, 2);
+  assert.match(scanPers.stdout, /^context: projects\/personal-dni\.md:2 \(es-dni\)$/m);
+  assert.match(scanPers.stdout, /^team studio: projects\/studio-iban\.md:1 \(es-iban\)$/m);
+  assert.ok(!scanPers.stdout.includes(dni) && !scanPers.stdout.includes(iban));
+
+  const syncBlocked = pctx(alex, ['sync', '--cwd', alex.work]);
+  assert.equal(syncBlocked.status, 2);
+  assert.match(syncBlocked.stderr, /^context: blocked: possible secrets or personal data found/m);
+  assert.match(syncBlocked.stderr, /projects\/personal-dni\.md:2 \(es-dni\)/);
+  assert.match(syncBlocked.stderr, /^team studio: blocked: possible secrets or personal data found/m);
+  assert.match(syncBlocked.stderr, /projects\/studio-iban\.md:1 \(es-iban\)/);
+  assert.ok(!syncBlocked.stderr.includes(dni) && !syncBlocked.stderr.includes(iban));
+  assert.equal(remoteHead(sb), persHeadBefore, 'blocked personal repo must not push');
+  assert.equal(git(['--git-dir', studioRemote, 'rev-parse', 'main']).stdout.trim(), studioHeadBefore, 'blocked studio repo must not push');
+
+  // Remove only studio's IBAN -> studio syncs while personal remains blocked!
+  fs.rmSync(path.join(studioDir, 'projects', 'studio-iban.md'));
+  const partialSync = pctx(alex, ['sync', '--cwd', alex.work]);
+  assert.equal(partialSync.status, 2);
+  assert.match(partialSync.stderr, /^context: blocked/m);
+  assert.match(partialSync.stdout, /^team studio: synced/m);
+  assert.equal(remoteHead(sb), persHeadBefore, 'blocked personal repo still must not push');
+  assert.ok(remoteFilesOf(studioRemote).includes('projects/studio-dni-ok.md'));
+
+  // Clean personal DNI -> personal syncs with IBAN intact.
+  fs.rmSync(path.join(alex.context, 'projects', 'personal-dni.md'));
+  assert.equal(pctx(alex, ['sync', '--cwd', alex.work]).status, 0);
+  assert.ok(remoteFiles(sb).includes('projects/personal-ok.md'));
+
+  // 2) Isolated team scope: acme shared blocks es-pii, while acme private blocks only es-mobile.
+  const acmeHeadBefore = git(['--git-dir', acmeRemote, 'rev-parse', 'main']).stdout.trim();
+  const acmePrivHeadBefore = git(['--git-dir', acmePrivRemote, 'rev-parse', 'main']).stdout.trim();
+  write(path.join(acmeDir, 'projects', 'corp-leak.md'), `NIE X0000000T\n`);
+  write(path.join(acmePrivDir, 'projects', 'priv-ok.md'), `DNI ${dni} and IBAN ${iban}\n`);
+
+  const corpSync = pctx(alex, ['sync', '--cwd', corpRepo]);
+  assert.equal(corpSync.status, 2);
+  assert.match(corpSync.stderr, /^team acme: blocked.*corp-leak\.md:1 \(es-nie\)/ms);
+  assert.match(corpSync.stdout, /^private acme: synced/m);
+  assert.equal(git(['--git-dir', acmeRemote, 'rev-parse', 'main']).stdout.trim(), acmeHeadBefore);
+  assert.notEqual(git(['--git-dir', acmePrivRemote, 'rev-parse', 'main']).stdout.trim(), acmePrivHeadBefore);
+
+  // Now test es-mobile + GOCSPX- together in acme private repo.
+  const oauthSecret = 'GOCSPX-' + 'x9K2mP4qR6'.repeat(3).slice(0, 28);
+  const privHead2 = git(['--git-dir', acmePrivRemote, 'rev-parse', 'main']).stdout.trim();
+  write(path.join(acmePrivDir, 'projects', 'priv-both.md'), `secret=${oauthSecret}\ntel=${mobile}\n`);
+  const corpScan = pctx(alex, ['scan', '--cwd', corpRepo]);
+  assert.equal(corpScan.status, 2);
+  assert.match(corpScan.stdout, /^private acme: projects\/priv-both\.md:1 \(google-oauth-secret\)$/m);
+  assert.match(corpScan.stdout, /^private acme: projects\/priv-both\.md:2 \(es-mobile\)$/m);
+  assert.ok(!corpScan.stdout.includes(oauthSecret) && !corpScan.stdout.includes(mobile));
+
+  const corpSync2 = pctx(alex, ['sync', '--cwd', corpRepo]);
+  assert.equal(corpSync2.status, 2);
+  assert.match(corpSync2.stderr, /projects\/priv-both\.md:1 \(google-oauth-secret\)/);
+  assert.match(corpSync2.stderr, /projects\/priv-both\.md:2 \(es-mobile\)/);
+  assert.equal(git(['--git-dir', acmePrivRemote, 'rev-parse', 'main']).stdout.trim(), privHead2);
+});
+
+test('invalid scanRules or privateScanRules fail before any commit or push runs', () => {
+  const sb = makeSandbox();
+  const a = makeDevice(sb, 'laptop');
+  setup(a, sb);
+  const headBefore = localHead(a);
+  const remoteBefore = remoteHead(sb);
+  write(path.join(a.context, 'projects', 'pending.md'), 'pending content\n');
+
+  for (const badRules of [['nonexistent-rule'], 'es-pii', [123]]) {
+    updateConfig(a, (cfg) => {
+      cfg.scanRules = badRules;
+    });
+    const scanRes = pctx(a, ['scan']);
+    assert.equal(scanRes.status, 1);
+    assert.match(scanRes.stderr, /scanRules/);
+
+    const syncRes = pctx(a, ['sync']);
+    assert.equal(syncRes.status, 1);
+    assert.match(syncRes.stderr, /scanRules/);
+    assert.equal(localHead(a), headBefore, 'invalid config must prevent commit');
+    assert.equal(remoteHead(sb), remoteBefore, 'invalid config must prevent push');
+  }
+});
