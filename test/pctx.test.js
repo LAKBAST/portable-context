@@ -914,3 +914,391 @@ test('team add refuses a different URL for an existing team name', () => {
   assert.equal(r.status, 1);
   assert.match(r.stderr, /already points at/);
 });
+
+// ---------------------------------------------------------------- remote identity & team isolation
+
+function makeProjectRepo(device, folderName, originUrl) {
+  const dir = path.join(device.work, folderName);
+  fs.mkdirSync(dir, { recursive: true });
+  git(['init', '-q', '-b', 'main', dir]);
+  if (originUrl) git(['-C', dir, 'remote', 'add', 'origin', originUrl]);
+  return dir;
+}
+
+function updateConfig(device, fn) {
+  const file = path.join(device.pctxHome, 'config.json');
+  const cfg = readJson(file);
+  const next = fn(cfg) ?? cfg;
+  fs.writeFileSync(file, `${JSON.stringify(next, null, 2)}\n`);
+  return next;
+}
+
+test('two hosts and a personal repo with the same basename stay completely separate', () => {
+  const sb = makeSandbox();
+  const acmeRemote = makeRemote(sb, 'acme-team');
+  const acmePrivRemote = makeRemote(sb, 'acme-priv');
+  const partnerRemote = makeRemote(sb, 'partner-team');
+  const alex = makeDevice(sb, 'alex-laptop');
+  setup(alex, sb, ['--author', 'alex', '--project-identity', 'remote']);
+
+  teamAdd(alex, 'acme', acmeRemote, [
+    '--isolated',
+    '--namespace', 'git.acme.example/platform',
+    '--private-url', acmePrivRemote,
+  ]);
+  teamAdd(alex, 'partner', partnerRemote, [
+    '--isolated',
+    '--remote', 'https://git.partner.example/core/api.git',
+  ]);
+
+  const personalApi = makeProjectRepo(alex, 'personal-api', 'https://github.com/alex/api.git');
+  const acmeApi = makeProjectRepo(alex, 'acme-api', 'https://git.acme.example/platform/api.git');
+  const acmeApiSsh = makeProjectRepo(alex, 'acme-api-ssh', 'git@git.acme.example:platform/api.git');
+  const acmeNested = makeProjectRepo(alex, 'acme-nested', 'https://git.acme.example/platform/billing/api.git');
+  const partnerApi = makeProjectRepo(alex, 'partner-api', 'git@git.partner.example:core/api.git');
+  const noRemote = makeProjectRepo(alex, 'api', null);
+
+  // Each repo resolves to a distinct session-path in its own repo.
+  const pPers = pctx(alex, ['session-path', '--cwd', personalApi]);
+  const pAcme = pctx(alex, ['session-path', '--cwd', acmeApi]);
+  const pAcmeSsh = pctx(alex, ['session-path', '--cwd', acmeApiSsh]);
+  const pAcmeNested = pctx(alex, ['session-path', '--cwd', acmeNested]);
+  const pPartner = pctx(alex, ['session-path', '--cwd', partnerApi]);
+  const pNoRemote = pctx(alex, ['session-path', '--cwd', noRemote]);
+  for (const r of [pPers, pAcme, pAcmeSsh, pAcmeNested, pPartner, pNoRemote]) {
+    assert.equal(r.status, 0, r.stderr);
+  }
+
+  const stem = (res) =>
+    path.basename(res.stdout.trim())
+      .replace(/^\d{4}-\d{2}-\d{2}-\d{4}-/, '')
+      .replace(new RegExp(`-(?:alex-)?${alex.name}\\.md$`), '');
+  // HTTPS and SSH of the exact same repo match the exact same project ID.
+  assert.equal(stem(pAcme), stem(pAcmeSsh));
+  // Personal, nested, partner, and no-remote all have distinct IDs.
+  const distinct = new Set([stem(pPers), stem(pAcme), stem(pAcmeNested), stem(pPartner), stem(pNoRemote)]);
+  assert.equal(distinct.size, 5);
+  assert.match(stem(pNoRemote), /^local--api$/);
+
+  assert.equal(real(path.dirname(pPers.stdout.trim())), real(path.join(alex.context, 'sessions')));
+  assert.equal(real(path.dirname(pAcme.stdout.trim())), real(path.join(alex.pctxHome, 'teams', 'acme', 'sessions')));
+  assert.equal(real(path.dirname(pPartner.stdout.trim())), real(path.join(alex.pctxHome, 'teams', 'partner', 'sessions')));
+
+  // Write distinct markers in personal and acme and check hooks never mix them.
+  write(pPers.stdout.trim(), '# Personal\nPERSONAL-API-MARKER\n');
+  write(path.join(alex.context, 'projects', `${stem(pPers)}.md`), 'PERSONAL-PROJ-MARKER\n');
+  write(pAcme.stdout.trim(), '# Acme\nACME-API-MARKER\n');
+  write(path.join(alex.pctxHome, 'teams', 'acme', 'projects', `${stem(pAcme)}.md`), 'ACME-PROJ-MARKER\n');
+  write(path.join(alex.pctxHome, 'teams', 'partner', 'projects', `${stem(pPartner)}.md`), 'PARTNER-PROJ-MARKER\n');
+
+  const hPers = hook(alex, personalApi);
+  assert.equal(hPers.status, 0);
+  assert.ok(hPers.stdout.includes('PERSONAL-PROJ-MARKER'));
+  assert.ok(!hPers.stdout.includes('ACME-PROJ-MARKER'));
+  assert.ok(!hPers.stdout.includes('PARTNER-PROJ-MARKER'));
+  assert.ok(!hPers.stdout.includes('Team repos:'));
+
+  const hAcme = hook(alex, acmeApiSsh);
+  assert.equal(hAcme.status, 0);
+  assert.ok(hAcme.stdout.includes('ACME-PROJ-MARKER'));
+  assert.ok(!hAcme.stdout.includes('PERSONAL-PROJ-MARKER'));
+  assert.ok(!hAcme.stdout.includes('PARTNER-PROJ-MARKER'));
+  assert.ok(!hAcme.stdout.includes(alex.context));
+});
+
+test('isolated corporate project resolves by remote even without projects/*.md and handles shared vs private storage', () => {
+  const sb = makeSandbox();
+  const acmeRemote = makeRemote(sb, 'acme-team');
+  const acmePrivRemote = makeRemote(sb, 'acme-priv');
+  const alex = makeDevice(sb, 'alex-laptop');
+  // Keep personal mode legacy to verify configured team scope still resolves by remote.
+  setup(alex, sb, ['--author', 'alex']);
+  teamAdd(alex, 'acme', acmeRemote, [
+    '--isolated',
+    '--namespace', 'git.acme.example/platform',
+    '--private-url', acmePrivRemote,
+  ]);
+
+  const freshCorp = makeProjectRepo(alex, 'brand-new-svc', 'https://git.acme.example/platform/brand-new-svc.git');
+  // No projects/<id>.md exists yet in acme!
+  const h = hook(alex, freshCorp);
+  assert.equal(h.status, 0);
+  assert.ok(h.stdout.includes('# Portable context (team acme)'), h.stdout);
+  assert.ok(h.stdout.includes('Remote: git.acme.example/platform/brand-new-svc'), h.stdout);
+  assert.ok(h.stdout.includes('No notes yet'), h.stdout);
+  assert.ok(!h.stdout.includes(alex.context), 'personal repo must not be shown');
+
+  const sharedPath = pctx(alex, ['session-path', '--cwd', freshCorp]);
+  assert.equal(sharedPath.status, 0, sharedPath.stderr);
+  assert.equal(real(path.dirname(sharedPath.stdout.trim())), real(path.join(alex.pctxHome, 'teams', 'acme', 'sessions')));
+
+  const privPath = pctx(alex, ['session-path', '--cwd', freshCorp, '--private']);
+  assert.equal(privPath.status, 0, privPath.stderr);
+  assert.equal(real(path.dirname(privPath.stdout.trim())), real(path.join(alex.pctxHome, 'teams', 'acme-private', 'sessions')));
+  assert.ok(!fs.existsSync(path.join(alex.context, 'sessions')), 'personal sessions dir must not be created');
+});
+
+test('isolated --private fails with no path when privateDir is missing or invalid', () => {
+  const sb = makeSandbox();
+  const acmeRemote = makeRemote(sb, 'acme-team');
+  const alex = makeDevice(sb, 'alex-laptop');
+  setup(alex, sb, ['--author', 'alex']);
+  teamAdd(alex, 'acme', acmeRemote, [
+    '--isolated',
+    '--namespace', 'git.acme.example/platform',
+  ]);
+  const corp = makeProjectRepo(alex, 'payments', 'https://git.acme.example/platform/payments.git');
+
+  // Unconfigured privateDir: fails and prints nothing on stdout.
+  const noPriv = pctx(alex, ['session-path', '--cwd', corp, '--private']);
+  assert.equal(noPriv.status, 1);
+  assert.equal(noPriv.stdout.trim(), '');
+  assert.match(noPriv.stderr, /no privateDir configured/);
+
+  // Symlink pointing privateDir at personal contextDir: rejected!
+  const linkToPersonal = path.join(alex.pctxHome, 'link-personal');
+  fs.symlinkSync(alex.context, linkToPersonal);
+  updateConfig(alex, (cfg) => {
+    cfg.teams[0].privateDir = linkToPersonal;
+  });
+  const symPriv = pctx(alex, ['session-path', '--cwd', corp, '--private']);
+  assert.equal(symPriv.status, 1);
+  assert.equal(symPriv.stdout.trim(), '');
+  assert.match(symPriv.stderr, /personal context repo/);
+
+  // Sync also refuses invalid privateDir.
+  const badSync = pctx(alex, ['sync', '--cwd', corp]);
+  assert.equal(badSync.status, 1);
+  assert.match(badSync.stderr, /personal context repo/);
+
+  // Pointing privateDir to a separate clone of the personal remote URL is also rejected!
+  const cloneOfPersonal = path.join(alex.pctxHome, 'second-personal-clone');
+  git(['clone', '-q', sb.remote, cloneOfPersonal]);
+  updateConfig(alex, (cfg) => {
+    cfg.teams[0].privateDir = cloneOfPersonal;
+  });
+  const sameRemotePriv = pctx(alex, ['session-path', '--cwd', corp, '--private']);
+  assert.equal(sameRemotePriv.status, 1);
+  assert.equal(sameRemotePriv.stdout.trim(), '');
+  assert.match(sameRemotePriv.stderr, /personal context repo/);
+
+  // Non-existent / non-git privateDir fails before writing or syncing.
+  const missingPriv = path.join(alex.pctxHome, 'does-not-exist');
+  updateConfig(alex, (cfg) => {
+    cfg.teams[0].privateDir = missingPriv;
+  });
+  const missRes = pctx(alex, ['session-path', '--cwd', corp, '--private']);
+  assert.equal(missRes.status, 1);
+  assert.equal(missRes.stdout.trim(), '');
+  assert.ok(!fs.existsSync(missingPriv), 'must not create directory for invalid privateDir');
+});
+
+test('ambiguous team scope fails safely across hook, session-path, share, scan, and sync', () => {
+  const sb = makeSandbox();
+  const r1 = makeRemote(sb, 'team-one');
+  const r2 = makeRemote(sb, 'team-two');
+  const alex = makeDevice(sb, 'alex-laptop');
+  setup(alex, sb, ['--author', 'alex']);
+  teamAdd(alex, 'one', r1, ['--isolated', '--namespace', 'git.acme.example/org']);
+  teamAdd(alex, 'two', r2, ['--isolated', '--remote', 'https://git.acme.example/org/app.git']);
+  write(path.join(alex.context, 'projects', 'app.md'), 'PERSONAL-SHOULD-NOT-LOAD\n');
+
+  const ambigRepo = makeProjectRepo(alex, 'app', 'https://git.acme.example/org/app.git');
+  const h = hook(alex, ambigRepo);
+  assert.equal(h.status, 0);
+  assert.match(h.stdout, /Ambiguous team scope/);
+  assert.ok(!h.stdout.includes('PERSONAL-SHOULD-NOT-LOAD'));
+
+  for (const args of [
+    ['session-path', '--cwd', ambigRepo],
+    ['team', 'share', 'one', '--cwd', ambigRepo],
+    ['sync', '--cwd', ambigRepo],
+    ['scan', '--cwd', ambigRepo],
+  ]) {
+    const res = pctx(alex, args);
+    assert.equal(res.status, 1, `expected failure for ${args.join(' ')}`);
+    assert.match(res.stderr, /Ambiguous team scope/);
+  }
+});
+
+test('explicit migration aliases load legacy personal notes only for declared remote, never by basename', () => {
+  const sb = makeSandbox();
+  const alex = makeDevice(sb, 'alex-laptop');
+  setup(alex, sb, ['--project-identity', 'remote']);
+
+  write(path.join(alex.context, 'projects', 'api.md'), '# legacy api\nLEGACY-ALEX-API-NOTES\n');
+  write(path.join(alex.context, 'sessions', '2026-01-01-1000-api-alex-laptop.md'), '# old session\n');
+  assert.equal(pctx(alex, ['sync']).status, 0);
+
+  updateConfig(alex, (cfg) => {
+    cfg.aliases = { api: 'github.com/alex/api' };
+  });
+
+  const ownApi = makeProjectRepo(alex, 'alex-api', 'https://github.com/alex/api.git');
+  const otherApi = makeProjectRepo(alex, 'other-api', 'https://github.com/other-org/api.git');
+
+  const hOwn = hook(alex, ownApi);
+  assert.equal(hOwn.status, 0);
+  assert.ok(hOwn.stdout.includes('LEGACY-ALEX-API-NOTES'), hOwn.stdout);
+  assert.ok(hOwn.stdout.includes('2026-01-01-1000-api-alex-laptop.md'), hOwn.stdout);
+
+  const hOther = hook(alex, otherApi);
+  assert.equal(hOther.status, 0);
+  assert.ok(!hOther.stdout.includes('LEGACY-ALEX-API-NOTES'), 'basename must not leak notes to another remote');
+  assert.ok(!hOther.stdout.includes('2026-01-01-1000-api-alex-laptop.md'), 'basename must not leak sessions');
+});
+
+test('cross-scope --project or foreign cwd cannot divert corporate saves to personal; --team allows explicit maintenance', () => {
+  const sb = makeSandbox();
+  const acmeRemote = makeRemote(sb, 'acme-team');
+  const acmePrivRemote = makeRemote(sb, 'acme-priv');
+  const alex = makeDevice(sb, 'alex-laptop');
+  setup(alex, sb, ['--author', 'alex', '--project-identity', 'remote']);
+  teamAdd(alex, 'acme', acmeRemote, [
+    '--isolated',
+    '--namespace', 'git.acme.example/platform',
+    '--private-url', acmePrivRemote,
+  ]);
+  const corp = makeProjectRepo(alex, 'payments', 'https://git.acme.example/platform/payments.git');
+
+  // Inside corporate cwd, --project with bare name, traversal, or personal remote fails cleanly.
+  for (const badProj of ['payments', 'personal-proj', '../escape', 'https://github.com/alex/solo.git']) {
+    const r = pctx(alex, ['session-path', '--cwd', corp, '--project', badProj]);
+    assert.equal(r.status, 1, `expected failure for --project ${badProj}`);
+    assert.equal(r.stdout.trim(), '');
+  }
+
+  // From unrelated cwd, bare name or corporate remote without --team fails rather than going to personal.
+  for (const args of [
+    ['session-path', '--cwd', alex.work, '--project', 'payments'],
+    ['session-path', '--cwd', alex.work, '--project', 'https://git.acme.example/platform/payments.git'],
+  ]) {
+    const r = pctx(alex, args);
+    assert.equal(r.status, 1);
+    assert.equal(r.stdout.trim(), '');
+  }
+
+  // Explicit maintenance from unrelated cwd via --team works cleanly and unambiguously.
+  const maintTeam = pctx(alex, [
+    'session-path', '--cwd', alex.work, '--team', 'acme', '--project', 'git.acme.example/platform/payments',
+  ]);
+  assert.equal(maintTeam.status, 0, maintTeam.stderr);
+  assert.equal(real(path.dirname(maintTeam.stdout.trim())), real(path.join(alex.pctxHome, 'teams', 'acme', 'sessions')));
+
+  const maintPriv = pctx(alex, [
+    'session-path', '--cwd', alex.work, '--team', 'acme', '--project', 'git.acme.example/platform/payments', '--private',
+  ]);
+  assert.equal(maintPriv.status, 0, maintPriv.stderr);
+  assert.equal(real(path.dirname(maintPriv.stdout.trim())), real(path.join(alex.pctxHome, 'teams', 'acme-private', 'sessions')));
+
+  const maintSync = pctx(alex, ['sync', '--cwd', alex.work, '--team', 'acme']);
+  assert.equal(maintSync.status, 0, maintSync.stderr);
+  assert.match(maintSync.stdout, /^team acme: /m);
+  assert.match(maintSync.stdout, /^private acme: /m);
+  assert.ok(!maintSync.stdout.includes('context:'));
+});
+
+test('bidirectional hook and sync with local bare remotes enforce strict personal/corporate isolation', () => {
+  const sb = makeSandbox();
+  const acmeRemote = makeRemote(sb, 'acme-team');
+  const acmePrivRemote = makeRemote(sb, 'acme-priv');
+  const alex = makeDevice(sb, 'alex-laptop');
+  const sam = makeDevice(sb, 'sam-pc');
+
+  setup(alex, sb, ['--author', 'alex', '--project-identity', 'remote']);
+  const samPersonalRemote = makeRemote(sb, 'sam-personal');
+  assert.equal(pctx(sam, ['setup', samPersonalRemote, '--device', sam.name, '--author', 'sam', '--project-identity', 'remote']).status, 0);
+
+  teamAdd(alex, 'acme', acmeRemote, [
+    '--isolated',
+    '--namespace', 'git.acme.example/platform',
+    '--private-url', acmePrivRemote,
+  ]);
+  teamAdd(sam, 'acme', acmeRemote, [
+    '--isolated',
+    '--namespace', 'git.acme.example/platform',
+  ]);
+
+  const personalProj = makeProjectRepo(alex, 'personal-app', 'https://github.com/alex/personal-app.git');
+  const corpProj = makeProjectRepo(alex, 'corp-app', 'https://git.acme.example/platform/corp-app.git');
+
+  // Create unpushed commit in acme team repo + marker in acme private repo.
+  const acmeSession = pctx(alex, ['session-path', '--cwd', corpProj]);
+  assert.equal(acmeSession.status, 0, acmeSession.stderr);
+  write(acmeSession.stdout.trim(), '# Corp session\nACME-SHARED-MARKER\n');
+  const acmePrivSession = pctx(alex, ['session-path', '--cwd', corpProj, '--private']);
+  assert.equal(acmePrivSession.status, 0, acmePrivSession.stderr);
+  write(acmePrivSession.stdout.trim(), '# Corp private\nACME-PRIV-MARKER\n');
+
+  // Commit locally in acme without pushing yet to verify personal hook does NOT push acme!
+  const acmeDir = path.join(alex.pctxHome, 'teams', 'acme');
+  git(['-C', acmeDir, 'add', '-A']);
+  git(['-C', acmeDir, 'commit', '-q', '-m', 'unpushed acme']);
+  const acmeHeadBefore = git(['--git-dir', acmeRemote, 'rev-parse', 'main']).stdout.trim();
+
+  // Personal hook + sync must only touch personal repo!
+  const persSession = pctx(alex, ['session-path', '--cwd', personalProj]);
+  assert.equal(persSession.status, 0, persSession.stderr);
+  write(persSession.stdout.trim(), '# Personal session\nPERSONAL-MARKER\n');
+  const hPersBefore = hook(alex, personalProj);
+  assert.equal(hPersBefore.status, 0);
+  assert.ok(!hPersBefore.stdout.includes('acme'));
+  assert.equal(git(['--git-dir', acmeRemote, 'rev-parse', 'main']).stdout.trim(), acmeHeadBefore, 'personal hook must not push isolated team');
+
+  const sPers = pctx(alex, ['sync', '--cwd', personalProj]);
+  assert.equal(sPers.status, 0, sPers.stderr);
+  assert.equal(git(['--git-dir', acmeRemote, 'rev-parse', 'main']).stdout.trim(), acmeHeadBefore, 'personal sync must not push isolated team');
+  assert.ok(remoteFiles(sb).some((f) => f.includes(path.basename(persSession.stdout.trim()))));
+
+  // Uncommitted personal file committed locally without pushing, to verify corporate hook/sync does NOT push personal!
+  write(path.join(alex.context, 'projects', 'unpushed-personal.md'), 'UNPUSHED-PERSONAL-MARKER\n');
+  git(['-C', alex.context, 'add', '-A']);
+  git(['-C', alex.context, 'commit', '-q', '-m', 'unpushed personal']);
+  const persHeadBefore = remoteHead(sb);
+
+  // Corporate hook + sync must only load/push acme and acme-private!
+  const hCorp = hook(alex, corpProj);
+  assert.equal(hCorp.status, 0);
+  assert.ok(!hCorp.stdout.includes('PERSONAL-MARKER'));
+  assert.ok(!hCorp.stdout.includes('UNPUSHED-PERSONAL-MARKER'));
+  assert.equal(remoteHead(sb), persHeadBefore, 'corporate hook must not push personal repo');
+  assert.notEqual(git(['--git-dir', acmeRemote, 'rev-parse', 'main']).stdout.trim(), acmeHeadBefore, 'corporate hook pushes pending acme commit');
+
+  const sCorp = pctx(alex, ['sync', '--cwd', corpProj]);
+  assert.equal(sCorp.status, 0, sCorp.stderr);
+  assert.match(sCorp.stdout, /^team acme: (?:synced|up-to-date)/m);
+  assert.match(sCorp.stdout, /^private acme: synced/m);
+  assert.equal(remoteHead(sb), persHeadBefore, 'corporate sync must not push personal repo');
+
+  assert.ok(remoteFilesOf(acmeRemote).includes(`sessions/${path.basename(acmeSession.stdout.trim())}`));
+  assert.ok(remoteFilesOf(acmePrivRemote).includes(`sessions/${path.basename(acmePrivSession.stdout.trim())}`));
+  assert.ok(!remoteFilesOf(acmeRemote).some((f) => f.includes('personal-app')));
+
+  // Teammate Sam pulls via hook in corpProj and sees ACME-SHARED-MARKER, never ACME-PRIV-MARKER or PERSONAL-MARKER.
+  const samCorp = makeProjectRepo(sam, 'corp-app', 'git@git.acme.example:platform/corp-app.git');
+  const hSam = hook(sam, samCorp);
+  assert.equal(hSam.status, 0);
+  assert.ok(hSam.stdout.includes(path.basename(acmeSession.stdout.trim())));
+  assert.ok(!hSam.stdout.includes(path.basename(acmePrivSession.stdout.trim())));
+  assert.ok(!hSam.stdout.includes('PERSONAL-MARKER'));
+});
+
+test('save skill isolates Working style and handles missing private destination; credentials are redacted', () => {
+  const sb = makeSandbox();
+  const acmeRemote = makeRemote(sb, 'acme-team');
+  const a = makeDevice(sb, 'laptop');
+  setup(a, sb);
+  const skill = fs.readFileSync(path.join(a.claude, 'skills', 'save-context', 'SKILL.md'), 'utf8');
+  assert.match(skill, /never compare `## Working style` with the personal context repo/i);
+  assert.match(skill, /if `--private` fails because no private destination is configured/i);
+
+  const token = 's3cr3t_team_tok';
+  const r = pctx(a, ['team', 'add', 'acme', `https://bot:${token}@git.acme.example/team.git`]);
+  assert.equal(r.status, 1);
+  assert.ok(!r.stderr.includes(token), 'credential must never appear in stderr');
+
+  teamAdd(a, 'acme', acmeRemote, ['--isolated', '--namespace', 'git.acme.example/platform']);
+  const doc = pctx(a, ['doctor']);
+  assert.equal(doc.status, 0);
+  assert.match(doc.stdout, /Team acme:.*\[isolated/);
+});
