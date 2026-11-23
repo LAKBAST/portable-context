@@ -1741,6 +1741,32 @@ test('explicit migration aliases autoload decisions/<alias>.md only for declared
   assert.ok(hOther.stdout.includes(`- api.md (personal: ${path.join(alex.context, 'decisions', 'api.md')})`), hOther.stdout);
 });
 
+test('team aliases do not load personal decisions or count unrelated personal saves', () => {
+  const sb = makeSandbox();
+  const studioRemote = makeRemote(sb, 'studio-team');
+  const alex = makeDevice(sb, 'alex-laptop');
+  setup(alex, sb, ['--project-identity', 'remote']);
+  teamAdd(alex, 'studio', studioRemote);
+  const studioDir = path.join(alex.pctxHome, 'teams', 'studio');
+  const project = makeProjectRepo(alex, 'studio-api', 'https://github.com/studio/api.git');
+
+  updateConfig(alex, (cfg) => {
+    cfg.aliases = { api: 'github.com/alex/api' };
+    cfg.teams[0].remotes = ['github.com/studio/api'];
+    cfg.teams[0].aliases = { api: 'github.com/studio/api' };
+  });
+  write(path.join(alex.context, 'decisions', 'api.md'), 'UNRELATED-PERSONAL-DECISION\n');
+  write(path.join(studioDir, 'decisions', 'api.md'), 'TEAM-ALIAS-DECISION\n');
+  write(path.join(alex.context, 'sessions', '2002-01-01-0900-api-laptop.md'), 'unrelated\n');
+  write(path.join(studioDir, 'sessions', '2001-01-01-0900-api-colleague.md'), 'team session\n');
+
+  const result = hook(alex, project);
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /TEAM-ALIAS-DECISION/);
+  assert.doesNotMatch(result.stdout, /UNRELATED-PERSONAL-DECISION|2002-01-01/);
+  assert.match(result.stdout, /REMINDER: [^\n]+2001-01-01/);
+});
+
 test('decisions index enforces stable ordering and budget bounds across many files', () => {
   const sb = makeSandbox();
   const studioRemote = makeRemote(sb, 'studio-team');

@@ -957,11 +957,11 @@ function formatScopedBody({ primaryFile, primaryText, aliasFile, aliasText }, ma
   return emptyText;
 }
 
-function projectDecisionSections(repos, projectId, alias, decisionMax = DEFAULT_LIMITS.decision) {
+function projectDecisionSections(repos, projectId, decisionMax = DEFAULT_LIMITS.decision) {
   if (!projectId) return [];
   const sections = [];
   for (const repo of repos) {
-    const data = readScopedMarkdown(repo.dir, 'decisions', projectId, alias, { checkInside: true });
+    const data = readScopedMarkdown(repo.dir, 'decisions', projectId, repo.alias, { checkInside: true });
     const body = formatScopedBody(data, decisionMax, 'decisions');
     if (body) sections.push(`## ${repo.heading}\n\n${body}`);
   }
@@ -1057,9 +1057,9 @@ function parseSessionDate(filename) {
   };
 }
 
-function latestProjectSave(dirs, projectId, alias, todayNumber) {
+function latestProjectSave(repos, projectId, todayNumber) {
   let latest = null;
-  for (const dir of dirs) {
+  for (const { dir, alias } of repos) {
     const sessionsDir = resolveSafeSubdir(dir, 'sessions');
     if (!sessionsDir) continue;
     for (const name of readdirSync(sessionsDir)) {
@@ -1074,10 +1074,10 @@ function latestProjectSave(dirs, projectId, alias, todayNumber) {
   return latest;
 }
 
-function staleSaveReminder(dirs, projectId, alias, staleSaveDays, now) {
+function staleSaveReminder(repos, projectId, staleSaveDays, now) {
   if (!projectId || staleSaveDays === 0) return [];
   const todayNumber = calendarDayNumber(now.getFullYear(), now.getMonth() + 1, now.getDate());
-  const latest = latestProjectSave(dirs, projectId, alias, todayNumber);
+  const latest = latestProjectSave(repos, projectId, todayNumber);
   if (!latest) return [];
   const ageDays = todayNumber - latest.dayNumber;
   if (ageDays < staleSaveDays) return [];
@@ -1120,29 +1120,28 @@ function buildIsolatedContext(
   }
   const teamSessions = recentSessions(team.dir, projectId, resolved.alias);
   const privateSessions = privateUsable ? recentSessions(team.privateDir, projectId, resolved.alias) : [];
-  const decisionRepos = [
-    { label: `team ${team.name}`, dir: team.dir, heading: `Team ${team.name} decisions for ${projectId}` },
+  const contextRepos = [
+    { label: `team ${team.name}`, dir: team.dir, alias: resolved.alias, heading: `Team ${team.name} decisions for ${projectId}` },
     ...(privateUsable
-      ? [{ label: `private ${team.name}`, dir: team.privateDir, heading: `Your private decisions for ${projectId}` }]
+      ? [{ label: `private ${team.name}`, dir: team.privateDir, alias: resolved.alias, heading: `Your private decisions for ${projectId}` }]
       : []),
   ];
-  const visibleSessionDirs = [team.dir, ...(privateUsable ? [team.privateDir] : [])];
   return [
     `# Portable context (team ${team.name})`,
     `Team repo: ${team.dir}`,
     ...(team.privateDir ? [`Private repo: ${team.privateDir}`] : []),
     ...warningLine(`team ${team.name}`, teamResults[team.name]),
     ...(team.privateDir ? warningLine(`private ${team.name}`, privateResult) : []),
-    ...staleSaveReminder(visibleSessionDirs, projectId, resolved.alias, staleSaveDays, now),
+    ...staleSaveReminder(contextRepos, projectId, staleSaveDays, now),
     ...(privateUsable ? profileSection(team.privateDir, `Your private profile (team ${team.name})`, limits.profile) : []),
     ...teamProjectSections(team.privateDir, team, projectId, resolved.display, resolved.alias, {
       includePrivate: privateUsable,
       profileMax: limits.profile,
       projectMax: limits.project,
     }),
-    ...projectDecisionSections(decisionRepos, projectId, resolved.alias, limits.decision),
+    ...projectDecisionSections(contextRepos, projectId, limits.decision),
     ...listSection('Other projects', others),
-    ...decisionsIndexSection(decisionRepos),
+    ...decisionsIndexSection(contextRepos),
     ...listSection(`Recent team sessions for this project (${join(team.dir, 'sessions')})`, teamSessions),
     ...(privateUsable
       ? listSection(`Recent private sessions for this project (${join(team.privateDir, 'sessions')})`, privateSessions)
@@ -1178,17 +1177,18 @@ export function buildContext(config, cwd, syncResult, teamResults = {}, extra = 
     ? [`Team repos: ${nonIsolatedTeams.map((t) => `${t.name} (${t.dir})`).join(', ')}`]
     : [];
   const teamSessions = team ? recentSessions(team.dir, projectId, resolved.alias) : [];
-  const decisionIndexRepos = [
-    { label: 'personal', dir },
-    ...(team ? [{ label: `team ${team.name}`, dir: team.dir }] : []),
+  const personalAlias = team
+    ? Object.entries(config.aliases ?? {}).find(
+        ([, remote]) => resolved.display && parseRemote(remote, { allowShorthand: true })?.canonical === resolved.display,
+      )?.[0]
+    : resolved.alias;
+  // A team alias applies to that team's notes and sessions only.
+  const contextRepos = [
+    { label: 'personal', dir, alias: personalAlias, heading: `${team ? 'Your private decisions for' : 'Project decisions:'} ${projectId}` },
+    ...(team
+      ? [{ label: `team ${team.name}`, dir: team.dir, alias: resolved.alias, heading: `Team ${team.name} decisions for ${projectId}` }]
+      : []),
   ];
-  const decisionAutoloadRepos = team
-    ? [
-        { dir: team.dir, heading: `Team ${team.name} decisions for ${projectId}` },
-        { dir, heading: `Your private decisions for ${projectId}` },
-      ]
-    : [{ dir, heading: `Project decisions: ${projectId}` }];
-  const visibleSessionDirs = [dir, ...(team ? [team.dir] : [])];
   return [
     '# Portable context',
     `Context repo: ${dir}`,
@@ -1196,7 +1196,7 @@ export function buildContext(config, cwd, syncResult, teamResults = {}, extra = 
     ...warningLine('the context', syncResult),
     ...nonIsolatedTeams.flatMap((t) => warningLine(`team ${t.name}`, teamResults[t.name])),
     ...(resolved.conflict ? [`WARNING: ${resolved.conflict}. Tell the user.`] : []),
-    ...staleSaveReminder(visibleSessionDirs, projectId, resolved.alias, staleSaveDays, now),
+    ...staleSaveReminder(contextRepos, projectId, staleSaveDays, now),
     ...profileSection(dir, 'Profile', limits.profile),
     ...(team
       ? teamProjectSections(dir, team, projectId, resolved.display, resolved.alias, {
@@ -1204,10 +1204,10 @@ export function buildContext(config, cwd, syncResult, teamResults = {}, extra = 
           projectMax: limits.project,
         })
       : projectSection(dir, projectId, resolved.display, resolved.alias, limits.project)),
-    ...projectDecisionSections(decisionAutoloadRepos, projectId, resolved.alias, limits.decision),
+    ...projectDecisionSections(contextRepos, projectId, limits.decision),
     ...listSection('Other projects', others),
-    ...decisionsIndexSection(decisionIndexRepos),
-    ...listSection('Recent sessions for this project', recentSessions(dir, projectId, resolved.alias)),
+    ...decisionsIndexSection(contextRepos),
+    ...listSection('Recent sessions for this project', recentSessions(dir, projectId, personalAlias)),
     ...listSection(`Recent team sessions for this project (${join(team?.dir ?? '', 'sessions')})`, teamSessions),
   ].join('\n\n');
 }
