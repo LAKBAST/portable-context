@@ -1101,13 +1101,20 @@ test('ambiguous team scope fails safely across hook, session-path, share, scan, 
   setup(alex, sb, ['--author', 'alex']);
   teamAdd(alex, 'one', r1, ['--isolated', '--namespace', 'git.acme.example/org']);
   teamAdd(alex, 'two', r2, ['--isolated', '--remote', 'https://git.acme.example/org/app.git']);
+  write(path.join(alex.context, 'AGENTS.md'), 'PERSONAL-PROFILE-SHOULD-NOT-LOAD\n');
   write(path.join(alex.context, 'projects', 'app.md'), 'PERSONAL-SHOULD-NOT-LOAD\n');
+  git(['-C', alex.context, 'add', '-A']);
+  git(['-C', alex.context, 'commit', '-q', '-m', 'pending personal commit']);
+  const personalHeadBefore = remoteHead(sb);
 
   const ambigRepo = makeProjectRepo(alex, 'app', 'https://git.acme.example/org/app.git');
   const h = hook(alex, ambigRepo);
   assert.equal(h.status, 0);
-  assert.match(h.stdout, /Ambiguous team scope/);
+  assert.match(h.stdout, /^Portable context unavailable: Ambiguous team scope/);
+  assert.ok(!h.stdout.includes('# Portable context'), 'hook must emit only the error');
+  assert.ok(!h.stdout.includes('PERSONAL-PROFILE-SHOULD-NOT-LOAD'));
   assert.ok(!h.stdout.includes('PERSONAL-SHOULD-NOT-LOAD'));
+  assert.equal(remoteHead(sb), personalHeadBefore, 'ambiguous isolated conflict must not push personal commit');
 
   for (const args of [
     ['session-path', '--cwd', ambigRepo],
@@ -1119,6 +1126,30 @@ test('ambiguous team scope fails safely across hook, session-path, share, scan, 
     assert.equal(res.status, 1, `expected failure for ${args.join(' ')}`);
     assert.match(res.stderr, /Ambiguous team scope/);
   }
+
+  // Collision involving one isolated team and one non-isolated scoped team also blocks personal fallback and push.
+  const r3 = makeRemote(sb, 'team-three');
+  teamAdd(alex, 'three', r3, ['--namespace', 'git.mixed.example/org']);
+  const r4 = makeRemote(sb, 'team-four');
+  teamAdd(alex, 'four', r4, ['--isolated', '--remote', 'https://git.mixed.example/org/svc.git']);
+  const mixedRepo = makeProjectRepo(alex, 'svc', 'https://git.mixed.example/org/svc.git');
+  const hMixed = hook(alex, mixedRepo);
+  assert.equal(hMixed.status, 0);
+  assert.match(hMixed.stdout, /^Portable context unavailable: Ambiguous team scope/);
+  assert.ok(!hMixed.stdout.includes('# Portable context'));
+  assert.ok(!hMixed.stdout.includes('PERSONAL-PROFILE-SHOULD-NOT-LOAD'));
+  assert.equal(remoteHead(sb), personalHeadBefore, 'mixed isolated collision must not push personal commit');
+
+  // Legacy collision between two non-isolated teams preserves WARNING + personal context behavior.
+  const r5 = makeRemote(sb, 'team-five');
+  teamAdd(alex, 'five', r5, ['--namespace', 'git.legacy.example/org']);
+  const r6 = makeRemote(sb, 'team-six');
+  teamAdd(alex, 'six', r6, ['--namespace', 'git.legacy.example/org']);
+  const legacyRepo = makeProjectRepo(alex, 'legacy', 'https://git.legacy.example/org/legacy.git');
+  const hLegacy = hook(alex, legacyRepo);
+  assert.equal(hLegacy.status, 0);
+  assert.ok(hLegacy.stdout.includes('# Portable context'));
+  assert.match(hLegacy.stdout, /WARNING: Ambiguous team scope/);
 });
 
 test('explicit migration aliases load legacy personal notes only for declared remote, never by basename', () => {
@@ -1304,4 +1335,101 @@ test('save skill isolates Working style and handles missing private destination;
   const doc = pctx(a, ['doctor']);
   assert.equal(doc.status, 0);
   assert.match(doc.stdout, /Team acme:.*\[isolated/);
+});
+
+test('case-distinct remotes and non-default ports stay separate; case-variant of isolated scope never falls back to personal', () => {
+  const sb = makeSandbox();
+  const acmeRemote = makeRemote(sb, 'acme-team');
+  const alex = makeDevice(sb, 'alex-laptop');
+  setup(alex, sb, ['--author', 'alex', '--project-identity', 'remote']);
+  teamAdd(alex, 'acme', acmeRemote, ['--isolated', '--namespace', 'git.acme.example/platform']);
+
+  write(path.join(alex.context, 'AGENTS.md'), 'PERSONAL-PROFILE-MARKER\n');
+  git(['-C', alex.context, 'add', '-A']);
+  git(['-C', alex.context, 'commit', '-q', '-m', 'pending personal']);
+  const persHeadBefore = remoteHead(sb);
+
+  const portA = makeProjectRepo(alex, 'port-a', 'https://git.custom.example:8443/Team/Api.git');
+  const portB = makeProjectRepo(alex, 'port-b', 'https://git.custom.example:9443/Team/Api.git');
+  const lowerA = makeProjectRepo(alex, 'lower-a', 'https://git.custom.example:8443/team/api.git');
+  const stems = [portA, portB, lowerA].map((dir) => {
+    const res = pctx(alex, ['session-path', '--cwd', dir]);
+    assert.equal(res.status, 0, res.stderr);
+    return path.basename(res.stdout.trim()).replace(/^\d{4}-\d{2}-\d{2}-\d{4}-/, '').replace(/-alex-laptop\.md$/, '');
+  });
+  assert.equal(new Set(stems).size, 3, `expected 3 distinct IDs, got ${stems.join(', ')}`);
+
+  // Case-variant of isolated team namespace must not fall back to personal or push personal commits.
+  const caseVariant = makeProjectRepo(alex, 'case-var', 'https://git.acme.example/Platform/api.git');
+  const h = hook(alex, caseVariant);
+  assert.equal(h.status, 0);
+  assert.match(h.stdout, /^Portable context unavailable:.*differs only in path casing/);
+  assert.ok(!h.stdout.includes('PERSONAL-PROFILE-MARKER'));
+  assert.equal(remoteHead(sb), persHeadBefore);
+  assert.equal(pctx(alex, ['session-path', '--cwd', caseVariant]).status, 1);
+  assert.equal(pctx(alex, ['sync', '--cwd', caseVariant]).status, 1);
+});
+
+test('isolated push destination validation blocks pushurl/pushRemote leaks and pushes explicitly to origin', () => {
+  const sb = makeSandbox();
+  const acmeRemote = makeRemote(sb, 'acme-team');
+  const acmePrivRemote = makeRemote(sb, 'acme-priv');
+  const rogueRemote = makeRemote(sb, 'rogue');
+  const alex = makeDevice(sb, 'alex-laptop');
+  setup(alex, sb, ['--author', 'alex', '--project-identity', 'remote']);
+  teamAdd(alex, 'acme', acmeRemote, [
+    '--isolated',
+    '--namespace', 'git.acme.example/platform',
+    '--private-url', acmePrivRemote,
+  ]);
+  const corp = makeProjectRepo(alex, 'payments', 'https://git.acme.example/platform/payments.git');
+  const acmePrivDir = path.join(alex.pctxHome, 'teams', 'acme-private');
+  const persHeadBefore = remoteHead(sb);
+
+  // 1) Multiple pushurls on privateDir where one is a file:// symlink to the personal bare repo.
+  const linkToPersonalRemote = path.join(sb.root, 'personal-link.git');
+  fs.symlinkSync(sb.remote, linkToPersonalRemote);
+  git(['-C', acmePrivDir, 'config', '--add', 'remote.origin.pushurl', acmePrivRemote]);
+  git(['-C', acmePrivDir, 'config', '--add', 'remote.origin.pushurl', `file://${linkToPersonalRemote}`]);
+
+  const blockedPriv = pctx(alex, ['session-path', '--cwd', corp, '--private']);
+  assert.equal(blockedPriv.status, 1);
+  assert.match(blockedPriv.stderr, /personal context repo/);
+  assert.equal(pctx(alex, ['sync', '--cwd', corp]).status, 1);
+  assert.equal(remoteHead(sb), persHeadBefore);
+
+  // Clean up pushurl and test local remote.pushDefault pointing to personal remote.
+  git(['-C', acmePrivDir, 'config', '--unset-all', 'remote.origin.pushurl']);
+  git(['-C', acmePrivDir, 'remote', 'add', 'leak', sb.remote]);
+  git(['-C', acmePrivDir, 'config', 'remote.pushDefault', 'leak']);
+  assert.equal(pctx(alex, ['session-path', '--cwd', corp, '--private']).status, 1);
+  assert.equal(pctx(alex, ['sync', '--cwd', corp]).status, 1);
+  assert.equal(remoteHead(sb), persHeadBefore);
+
+  // 2) With remote.pushDefault & branch.main.pushRemote pointing to a third bare repo (rogue),
+  // isolated sync and hook still push ONLY to origin (acmePrivRemote), leaving rogue and personal untouched.
+  git(['-C', acmePrivDir, 'remote', 'set-url', 'leak', rogueRemote]);
+  git(['-C', acmePrivDir, 'config', 'branch.main.pushRemote', 'leak']);
+  const rogueHeadBefore = git(['--git-dir', rogueRemote, 'rev-parse', 'main'], { allowFail: true });
+  assert.notEqual(rogueHeadBefore.status, 0, 'rogue bare repo starts empty');
+
+  const privSession = pctx(alex, ['session-path', '--cwd', corp, '--private']);
+  assert.equal(privSession.status, 0, privSession.stderr);
+  write(privSession.stdout.trim(), '# Private\nISOLATED-ONLY-ORIGIN\n');
+  const s = pctx(alex, ['sync', '--cwd', corp]);
+  assert.equal(s.status, 0, s.stderr);
+  assert.match(s.stdout, /^private acme: synced/m);
+  assert.ok(remoteFilesOf(acmePrivRemote).includes(`sessions/${path.basename(privSession.stdout.trim())}`));
+  assert.equal(remoteHead(sb), persHeadBefore, 'personal bare repo must receive no changes');
+  assert.notEqual(git(['--git-dir', rogueRemote, 'rev-parse', 'main'], { allowFail: true }).status, 0, 'rogue bare repo must receive no changes');
+
+  // Pending commit in acmePrivDir pushed via hook also goes only to origin.
+  write(path.join(acmePrivDir, 'projects', 'hook-push.md'), 'HOOK-ORIGIN-ONLY\n');
+  git(['-C', acmePrivDir, 'add', '-A']);
+  git(['-C', acmePrivDir, 'commit', '-q', '-m', 'pending priv']);
+  const h = hook(alex, corp);
+  assert.equal(h.status, 0);
+  assert.ok(remoteFilesOf(acmePrivRemote).includes('projects/hook-push.md'));
+  assert.equal(remoteHead(sb), persHeadBefore);
+  assert.notEqual(git(['--git-dir', rogueRemote, 'rev-parse', 'main'], { allowFail: true }).status, 0);
 });

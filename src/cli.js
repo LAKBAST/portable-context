@@ -182,6 +182,7 @@ function teamAdd([name, url], values) {
     validatePrivateDestination(nextConfig, team, git);
   }
   const { seeded } = setupContextRepo(url, dir, TEAM_TEMPLATE_DIR);
+  if (isolated) validateConfig(nextConfig, git);
   let privateSeeded = false;
   if (privateUrl && privateDir) {
     ({ seeded: privateSeeded } = setupContextRepo(privateUrl, privateDir));
@@ -381,19 +382,19 @@ function runHook(args) {
         const team = resolved.isolatedTeam;
         const teamResults = {};
         teamResults[team.name] = existsSync(join(team.dir, '.git'))
-          ? refresh(team.dir, deadline)
+          ? refresh(team.dir, deadline, { isolated: true })
           : { ok: false, message: `no clone at ${team.dir}; run pctx team add again` };
         let privateResult = null;
         if (team.privateDir) {
           try {
             validatePrivateDestination(config, team, git);
-            privateResult = refresh(team.privateDir, deadline);
+            privateResult = refresh(team.privateDir, deadline, { isolated: true });
           } catch (err) {
             privateResult = { ok: false, unusable: true, message: err.message };
           }
         }
         text = buildContext(config, workDir, null, teamResults, { resolved, privateResult });
-      } else if (resolved.isolatedTeam && resolved.conflict) {
+      } else if (resolved.conflict && (resolved.scopeKind === 'isolated' || resolved.isolatedTeam)) {
         text = `Portable context unavailable: ${resolved.conflict}`;
       } else {
         const personal = refresh(config.contextDir, deadline);
@@ -501,11 +502,12 @@ function runSync(values) {
   const config = requireConfig();
   const all = targetRepos(config, values);
   let code = 0;
-  for (const { label, dir, team } of all) {
+  for (const { label, dir, team, privateOf } of all) {
     const prefix = all.length > 1 ? `${label}: ` : '';
+    const isolated = Boolean(team?.isolated || privateOf?.isolated);
     const message = values.message || (team ? `context: update from ${config.author ?? config.device}` : undefined);
     const result = existsSync(join(dir, '.git'))
-      ? sync(config, message, dir)
+      ? sync(config, message, dir, { isolated })
       : { status: 'error', message: `no clone at ${dir}` };
     code = Math.max(code, reportSync(result, prefix));
   }

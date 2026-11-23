@@ -315,11 +315,77 @@ function repoCommonDir(dir, gitFn) {
   return normalizeRealPath(absCommon);
 }
 
-function repoOriginCanonical(dir, gitFn) {
-  if (!gitFn || !existsSync(joinGit(dir))) return null;
-  const origin = gitFn(dir, ['config', '--get', 'remote.origin.url']);
-  if (!origin.ok || !origin.stdout.trim()) return null;
-  return parseRemote(origin.stdout.trim())?.canonical ?? null;
+function addDestinationKeys(keys, rawUrl, baseDir) {
+  const trimmed = String(rawUrl ?? '').trim();
+  if (!trimmed) return;
+  const parsed = parseRemote(trimmed);
+  if (!parsed) return;
+  keys.add(parsed.canonical);
+  if (parsed.kind === 'local' && !parsed.host) {
+    let fsPath = trimmed;
+    if (/^file:\/\//i.test(trimmed)) {
+      try {
+        fsPath = decodeURIComponent(new URL(trimmed).pathname);
+        if (/^\/[A-Za-z]:(?:\/|$)/.test(fsPath)) fsPath = fsPath.slice(1);
+      } catch {
+        fsPath = '';
+      }
+    } else if (trimmed === '.' || trimmed === '..' || trimmed.startsWith('./') || trimmed.startsWith('../')) {
+      fsPath = resolve(baseDir, trimmed);
+    }
+    if (fsPath) {
+      if (existsSync(fsPath)) {
+        keys.add(`local-real:${normalizeRealPath(fsPath).replace(/\.git$/i, '')}`);
+      } else if (!/\.git$/i.test(fsPath) && existsSync(`${fsPath}.git`)) {
+        keys.add(`local-real:${normalizeRealPath(`${fsPath}.git`).replace(/\.git$/i, '')}`);
+      }
+    }
+  }
+}
+
+function collectLines(res, keys, baseDir) {
+  if (!res?.ok || !res.stdout) return;
+  for (const line of res.stdout.split(/\r?\n/)) {
+    if (line.trim()) addDestinationKeys(keys, line, baseDir);
+  }
+}
+
+function repoDestinationKeys(dir, gitFn, includePushTargets = false) {
+  const keys = new Set();
+  if (!gitFn || !existsSync(joinGit(dir))) return keys;
+  collectLines(gitFn(dir, ['config', '--get', 'remote.origin.url']), keys, dir);
+  if (!includePushTargets) return keys;
+
+  collectLines(gitFn(dir, ['remote', 'get-url', '--all', 'origin']), keys, dir);
+  collectLines(gitFn(dir, ['remote', 'get-url', '--push', '--all', 'origin']), keys, dir);
+  collectLines(gitFn(dir, ['config', '--get-all', 'remote.origin.pushurl']), keys, dir);
+
+  const pushTargets = [];
+  const pushDefault = gitFn(dir, ['config', '--local', '--get', 'remote.pushDefault']);
+  if (pushDefault.ok && pushDefault.stdout.trim()) pushTargets.push(pushDefault.stdout.trim());
+
+  const branchRemotes = gitFn(dir, ['config', '--local', '--get-regexp', '^branch\\..*\\.(?:pushremote|remote)$']);
+  if (branchRemotes.ok && branchRemotes.stdout) {
+    for (const line of branchRemotes.stdout.split(/\r?\n/)) {
+      const spaceAt = line.indexOf(' ');
+      if (spaceAt !== -1) {
+        const val = line.slice(spaceAt + 1).trim();
+        if (val) pushTargets.push(val);
+      }
+    }
+  }
+
+  for (const target of new Set(pushTargets)) {
+    if (!/[\\/:]/.test(target)) {
+      collectLines(gitFn(dir, ['remote', 'get-url', '--push', '--all', target]), keys, dir);
+      collectLines(gitFn(dir, ['remote', 'get-url', '--all', target]), keys, dir);
+      collectLines(gitFn(dir, ['config', '--get-all', `remote.${target}.pushurl`]), keys, dir);
+      collectLines(gitFn(dir, ['config', '--get', `remote.${target}.url`]), keys, dir);
+    } else {
+      addDestinationKeys(keys, target, dir);
+    }
+  }
+  return keys;
 }
 
 export function isInsideDir(candidate, dir) {
@@ -329,7 +395,7 @@ export function isInsideDir(candidate, dir) {
   return rc === rd || (rd !== '/' && rc.startsWith(`${rd}/`));
 }
 
-export function pathsOverlap(a, b, gitFn = null) {
+export function pathsOverlap(a, b, gitFn = null, { includePushTargets = false } = {}) {
   if (!a || !b) return false;
   const ra = normalizeRealPath(a);
   const rb = normalizeRealPath(b);
@@ -339,9 +405,11 @@ export function pathsOverlap(a, b, gitFn = null) {
   const ca = repoCommonDir(a, gitFn);
   const cb = repoCommonDir(b, gitFn);
   if (ca && cb && ca === cb) return true;
-  const ua = repoOriginCanonical(a, gitFn);
-  const ub = repoOriginCanonical(b, gitFn);
-  if (ua && ub && ua === ub) return true;
+  const ka = repoDestinationKeys(a, gitFn, includePushTargets);
+  const kb = repoDestinationKeys(b, gitFn, includePushTargets);
+  for (const key of ka) {
+    if (kb.has(key)) return true;
+  }
   return false;
 }
 
@@ -424,7 +492,7 @@ export function validateConfig(config, gitFn = null) {
     if (typeof team.dir !== 'string' || !team.dir.trim()) {
       throw new Error(`Team ${team.name} is missing a valid dir`);
     }
-    if (config.contextDir && pathsOverlap(team.dir, config.contextDir, gitFn)) {
+    if (config.contextDir && pathsOverlap(team.dir, config.contextDir, gitFn, team.isolated ? { includePushTargets: true } : undefined)) {
       throw new Error(`Team ${team.name} dir cannot overlap the personal context repo`);
     }
     if (team.remotes !== undefined) {
@@ -451,10 +519,10 @@ export function validateConfig(config, gitFn = null) {
         if (typeof team.privateDir !== 'string' || !team.privateDir.trim()) {
           throw new Error(`Isolated team ${team.name} has an invalid privateDir`);
         }
-        if (config.contextDir && pathsOverlap(team.privateDir, config.contextDir, gitFn)) {
+        if (config.contextDir && pathsOverlap(team.privateDir, config.contextDir, gitFn, { includePushTargets: true })) {
           throw new Error(`Team ${team.name} privateDir cannot be or overlap the personal context repo`);
         }
-        if (pathsOverlap(team.privateDir, team.dir, gitFn)) {
+        if (pathsOverlap(team.privateDir, team.dir, gitFn, { includePushTargets: true })) {
           throw new Error(`Team ${team.name} privateDir cannot be or overlap its shared team repo`);
         }
       }
@@ -467,16 +535,17 @@ export function validateConfig(config, gitFn = null) {
     for (let j = i + 1; j < teams.length; j++) {
       const a = teams[i];
       const b = teams[j];
-      if (pathsOverlap(a.dir, b.dir, gitFn)) {
+      const pairOpts = a.isolated || b.isolated ? { includePushTargets: true } : undefined;
+      if (pathsOverlap(a.dir, b.dir, gitFn, pairOpts)) {
         throw new Error(`Teams ${a.name} and ${b.name} cannot share or overlap directories`);
       }
-      if (a.privateDir && pathsOverlap(a.privateDir, b.dir, gitFn)) {
+      if (a.privateDir && pathsOverlap(a.privateDir, b.dir, gitFn, { includePushTargets: true })) {
         throw new Error(`Team ${a.name} privateDir cannot overlap team ${b.name} repo`);
       }
-      if (b.privateDir && pathsOverlap(b.privateDir, a.dir, gitFn)) {
+      if (b.privateDir && pathsOverlap(b.privateDir, a.dir, gitFn, { includePushTargets: true })) {
         throw new Error(`Team ${b.name} privateDir cannot overlap team ${a.name} repo`);
       }
-      if (a.privateDir && b.privateDir && pathsOverlap(a.privateDir, b.privateDir, gitFn)) {
+      if (a.privateDir && b.privateDir && pathsOverlap(a.privateDir, b.privateDir, gitFn, { includePushTargets: true })) {
         throw new Error(`Teams ${a.name} and ${b.name} cannot share or overlap privateDir`);
       }
     }
@@ -496,18 +565,18 @@ export function validatePrivateDestination(config, team, gitFn) {
     throw new Error(`Team ${team.name} has no privateDir configured`);
   }
   const allTeams = Array.isArray(config?.teams) ? config.teams : [];
-  if (config?.contextDir && pathsOverlap(team.privateDir, config.contextDir, gitFn)) {
+  if (config?.contextDir && pathsOverlap(team.privateDir, config.contextDir, gitFn, { includePushTargets: true })) {
     throw new Error(`Team ${team.name} privateDir cannot be or overlap the personal context repo`);
   }
-  if (pathsOverlap(team.privateDir, team.dir, gitFn)) {
+  if (pathsOverlap(team.privateDir, team.dir, gitFn, { includePushTargets: true })) {
     throw new Error(`Team ${team.name} privateDir cannot be or overlap its shared team repo`);
   }
   for (const other of allTeams) {
     if (other.name === team.name) continue;
-    if (pathsOverlap(team.privateDir, other.dir, gitFn)) {
+    if (pathsOverlap(team.privateDir, other.dir, gitFn, { includePushTargets: true })) {
       throw new Error(`Team ${team.name} privateDir cannot overlap team ${other.name} repo`);
     }
-    if (other.privateDir && pathsOverlap(team.privateDir, other.privateDir, gitFn)) {
+    if (other.privateDir && pathsOverlap(team.privateDir, other.privateDir, gitFn, { includePushTargets: true })) {
       throw new Error(`Team ${team.name} privateDir cannot overlap team ${other.name} privateDir`);
     }
   }

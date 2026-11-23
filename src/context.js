@@ -151,10 +151,19 @@ function stashCount(dir) {
   return git(dir, ['stash', 'list']).stdout.split('\n').filter(Boolean).length;
 }
 
-function pullRebase(dir, timeout = PULL_TIMEOUT) {
+function currentBranch(dir) {
+  const res = git(dir, ['symbolic-ref', '--short', '-q', 'HEAD']);
+  return res.ok ? res.stdout.trim() : '';
+}
+
+function pullRebase(dir, timeout = PULL_TIMEOUT, { isolated = false } = {}) {
   const stashed = stashCount(dir);
+  const branch = isolated ? currentBranch(dir) : '';
+  const pullArgs = branch
+    ? ['pull', '-q', '--rebase', '--autostash', 'origin', branch]
+    : ['pull', '-q', '--rebase', '--autostash'];
   // Replaying local commits needs a committer identity too.
-  const pull = git(dir, [...identityArgs(dir), 'pull', '-q', '--rebase', '--autostash'], { timeout });
+  const pull = git(dir, [...identityArgs(dir), ...pullArgs], { timeout });
   if (pull.ok) {
     // git exits 0 when the autostash cannot be reapplied, which would hide the user's edits.
     if (stashCount(dir) > stashed) {
@@ -169,27 +178,40 @@ function pullRebase(dir, timeout = PULL_TIMEOUT) {
   return { ok: false, message: `Could not pull: ${redactText(firstLine(pull.stderr)) || 'git pull failed'}` };
 }
 
-function aheadCount(dir) {
+function aheadCount(dir, { isolated = false } = {}) {
+  if (isolated) {
+    const branch = currentBranch(dir);
+    if (branch) {
+      const originAhead = git(dir, ['rev-list', '--count', `origin/${branch}..HEAD`]);
+      if (originAhead.ok) return Number(originAhead.stdout.trim()) || 0;
+    }
+  }
   const result = git(dir, ['rev-list', '--count', '@{u}..HEAD']);
   return result.ok ? Number(result.stdout.trim()) || 0 : 0;
 }
 
-function push(dir, timeout) {
-  const result = git(dir, ['push', '-q'], { timeout });
+function push(dir, timeout, { isolated = false } = {}) {
+  const args = isolated
+    ? (() => {
+        const branch = currentBranch(dir);
+        return ['-c', 'remote.pushDefault=origin', 'push', '-q', 'origin', ...(branch ? [branch] : [])];
+      })()
+    : ['push', '-q'];
+  const result = git(dir, args, { timeout });
   if (result.ok) return { ok: true };
   return { ok: false, message: `Could not push: ${redactText(firstLine(result.stderr)) || 'git push failed'}` };
 }
 
 // `deadline` (a Date.now() value) shortens the git timeouts so several repos fit in one hook run.
-export function refresh(dir, deadline = Infinity) {
+export function refresh(dir, deadline = Infinity, { isolated = false } = {}) {
   const left = () => deadline - Date.now();
   if (left() < MIN_REFRESH_TIME) return { ok: false, message: 'Not refreshed: no time left in the session hook' };
-  const pulled = pullRebase(dir, Math.min(PULL_TIMEOUT, left()));
+  const pulled = pullRebase(dir, Math.min(PULL_TIMEOUT, left()), { isolated });
   if (!pulled.ok) return { ok: false, message: pulled.message };
   // Retries saves that could not be pushed earlier, for example while offline.
-  if (aheadCount(dir) > 0) {
+  if (aheadCount(dir, { isolated }) > 0) {
     if (left() < MIN_REFRESH_TIME) return { ok: false, message: 'Pending saves not pushed: no time left in the session hook' };
-    const pushed = push(dir, Math.min(REFRESH_PUSH_TIMEOUT, left()));
+    const pushed = push(dir, Math.min(REFRESH_PUSH_TIMEOUT, left()), { isolated });
     if (!pushed.ok) return pushed;
   }
   return { ok: true };
@@ -327,17 +349,36 @@ function validateSafeProjectArg(raw) {
 function resolveRemoteScope(teams, parsed, validated, allowConflict) {
   const scopeMatches = matchingScopeTeams(teams, parsed);
   if (scopeMatches.length > 1) {
+    const involvesIsolated = scopeMatches.some((t) => t.isolated);
     const msg = `Ambiguous team scope for ${parsed.canonical} (matches teams: ${scopeMatches.map((t) => t.name).join(', ')})`;
-    if (allowConflict) return { conflict: msg, team: null, isolatedTeam: null };
+    if (allowConflict) return { conflict: msg, team: null, isolatedTeam: null, isolatedConflict: involvesIsolated };
     throw new Error(msg);
   }
   const scopeTeam = scopeMatches[0] ?? null;
+  if (!scopeTeam) {
+    const isolatedCaseMatches = teams.filter(
+      (t) => t.isolated && teamMatchesRemote(t, parsed, { caseInsensitivePath: true }),
+    );
+    if (isolatedCaseMatches.length) {
+      const names = isolatedCaseMatches.map((t) => t.name).join(', ');
+      const msg = `Remote ${parsed.canonical} differs only in path casing from isolated team scope (${names}); configure the exact canonical path or align the remote URL`;
+      if (allowConflict) {
+        return {
+          conflict: msg,
+          team: null,
+          isolatedTeam: isolatedCaseMatches.length === 1 ? isolatedCaseMatches[0] : null,
+          isolatedConflict: true,
+        };
+      }
+      throw new Error(msg);
+    }
+  }
   if (scopeTeam?.isolated) {
     const id = remoteProjectId(parsed);
     const otherWithFile = teams.filter((t) => t.name !== scopeTeam.name && existsSync(teamProjectFile(t, id)));
     if (otherWithFile.length) {
       const msg = `Ambiguous project ${parsed.canonical}: matched team ${scopeTeam.name} but notes exist in ${otherWithFile.map((t) => t.name).join(', ')}`;
-      if (allowConflict) return { conflict: msg, team: null, isolatedTeam: scopeTeam };
+      if (allowConflict) return { conflict: msg, team: null, isolatedTeam: scopeTeam, isolatedConflict: true };
       throw new Error(msg);
     }
     return {
@@ -396,11 +437,12 @@ export function resolveScope(config, { cwd, project, teamName, strictCwd = false
   if (info.parsedOrigin) {
     cwdResolved = resolveRemoteScope(teams, info.parsedOrigin, validated, allowConflict);
     if (cwdResolved.conflict && allowConflict) {
+      const isIsolated = Boolean(cwdResolved.isolatedTeam || cwdResolved.isolatedConflict || info.ownerTeam?.isolated);
       return {
         mode: validated.mode,
-        scopeKind: cwdResolved.isolatedTeam ? 'isolated' : 'personal',
+        scopeKind: isIsolated ? 'isolated' : 'personal',
         team: null,
-        isolatedTeam: cwdResolved.isolatedTeam,
+        isolatedTeam: cwdResolved.isolatedTeam ?? null,
         projectId: null,
         display: null,
         alias: null,
@@ -625,9 +667,23 @@ export function resolveScope(config, { cwd, project, teamName, strictCwd = false
     const parsedProj = parseRemote(trimmed, { allowShorthand: true });
     if (parsedProj) {
       const resolvedProj = resolveRemoteScope(teams, parsedProj, validated, allowConflict);
-      if (resolvedProj.isolatedTeam) {
+      if (resolvedProj.conflict && allowConflict) {
+        const isIsolated = Boolean(resolvedProj.isolatedTeam || resolvedProj.isolatedConflict);
+        return {
+          mode: validated.mode,
+          scopeKind: isIsolated ? 'isolated' : 'personal',
+          team: null,
+          isolatedTeam: resolvedProj.isolatedTeam ?? null,
+          projectId: null,
+          display: null,
+          alias: null,
+          conflict: resolvedProj.conflict,
+        };
+      }
+      if (resolvedProj.isolatedTeam || resolvedProj.isolatedConflict) {
         throw new Error(
-          `Project ${parsedProj.canonical} belongs to isolated team ${resolvedProj.isolatedTeam.name}; run inside that repo with --cwd or pass --team ${resolvedProj.isolatedTeam.name}`,
+          resolvedProj.conflict ??
+            `Project ${parsedProj.canonical} belongs to isolated team ${resolvedProj.isolatedTeam.name}; run inside that repo with --cwd or pass --team ${resolvedProj.isolatedTeam.name}`,
         );
       }
       return {
@@ -902,7 +958,7 @@ export function buildContext(config, cwd, syncResult, teamResults = {}, extra = 
   if (resolved.scopeKind === 'isolated' && resolved.isolatedTeam && !resolved.conflict) {
     return buildIsolatedContext(resolved.isolatedTeam, resolved, teamResults, extra.privateResult);
   }
-  if (resolved.isolatedTeam && resolved.conflict) {
+  if (resolved.conflict && (resolved.scopeKind === 'isolated' || resolved.isolatedTeam)) {
     return `Portable context unavailable: ${resolved.conflict}`;
   }
 
@@ -976,7 +1032,7 @@ function commitStaged(dir, message) {
   };
 }
 
-export function sync(config, message, dir = config.contextDir) {
+export function sync(config, message, dir = config.contextDir, { isolated = false } = {}) {
   let findings;
   try {
     findings = stagedFindings(dir);
@@ -991,12 +1047,12 @@ export function sync(config, message, dir = config.contextDir) {
   const { committed, error } = commitStaged(dir, message || `context: update from ${config.device}`);
   if (error) return { status: 'error', message: error };
 
-  const pulled = pullRebase(dir);
+  const pulled = pullRebase(dir, PULL_TIMEOUT, { isolated });
   if (!pulled.ok) return { status: 'local-only', message: pulled.message, committed };
 
-  const ahead = aheadCount(dir);
+  const ahead = aheadCount(dir, { isolated });
   if (ahead > 0) {
-    const pushed = push(dir, SYNC_PUSH_TIMEOUT);
+    const pushed = push(dir, SYNC_PUSH_TIMEOUT, { isolated });
     if (!pushed.ok) return { status: 'local-only', message: pushed.message, committed };
   }
   return { status: committed || ahead > 0 ? 'synced' : 'up-to-date', committed };
