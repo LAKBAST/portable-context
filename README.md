@@ -5,7 +5,7 @@ Your agent memories do not travel. What Claude Code learned on your laptop is no
 ## How it works
 
 - Your context lives in a git repo that you own (profile, per-project notes, saved sessions). `pctx setup` clones it to `~/.pctx/context` by default.
-- A SessionStart hook runs `pctx hook`. It pulls the repo and prints the context into the new session: your profile (`AGENTS.md`), the notes for the current project, a list of other projects, and recent sessions for this project. The project is identified by the basename of the `origin` remote of the working directory, or by the folder name when there is no remote.
+- A SessionStart hook runs `pctx hook`. It pulls the repo and prints the context into the new session: your profile (`AGENTS.md`), the notes for the current project, a list of other projects, and recent sessions for this project. By default (legacy mode), the project is identified by the basename of the `origin` remote of the working directory, or by the folder name when there is no remote; you can switch to host-and-full-path remote identity (`"projectIdentity": "remote"`) and configure isolated team scopes in `~/.pctx/config.json`.
 - A skill (`save-context`) lets the agent write a session summary into the repo and run `pctx sync`, which commits and pushes.
 - If git cannot pull or push (offline, conflict), the hook still prints your local context, adds a `WARNING` line, and exits 0. Unpushed commits stay local and are pushed on a later sync or hook run.
 
@@ -42,7 +42,7 @@ pctx setup https://github.com/<you>/context.git
 
 If the repo is empty, `setup` seeds it with `AGENTS.md`, `README.md` and `.gitignore` and pushes to `main`. It then saves `~/.pctx/config.json` and installs the hook and skill for Claude Code, Codex and Antigravity. Only tools whose home directory exists (`CLAUDE_CONFIG_DIR` or `~/.claude`; `CODEX_HOME` or `~/.codex`; `ANTIGRAVITY_CONFIG_DIR` or `~/.gemini/config`) are configured.
 
-Options: `--dir <path>` (where to clone), `--device <name>` (appears in session file names), `--skill-name <name>` (default `save-context`).
+Options: `--dir <path>` (where to clone), `--device <name>` (appears in session file names), `--skill-name <name>` (default `save-context`), `--project-identity <legacy|remote>` (default `legacy`).
 
 ## Add another device
 
@@ -108,23 +108,107 @@ A project is shared when `projects/<project>.md` exists in a team repo. For a sh
 
 Your profile, your other projects and their sessions never go to a team repo. You can be in several teams, but a project can only belong to one: if two team repos have notes for the same project, the hook loads neither and warns you, and `session-path` refuses until you remove it from one of them.
 
-`pctx sync` and `pctx scan` cover the context repo and every team; with teams, each output line starts with the repo (`context:` or `team <name>:`). `pctx team list` shows your teams and `pctx team remove <name>` stops loading one, leaving its clone in place.
+`pctx sync` and `pctx scan` cover the context repo and every non-isolated team; with teams, each output line starts with the repo (`context:` or `team <name>:`). `pctx team list` shows your teams and `pctx team remove <name>` stops loading one, leaving its clone in place.
+
+## Project identity by remote (host + full path)
+
+When two repositories share the same basename across different hosts or namespaces (for example `https://github.com/alex/api.git` and `https://git.acme.example/platform/api.git`), basename-only matching collides. Setting `"projectIdentity": "remote"` in `~/.pctx/config.json` (or passing `--project-identity remote` to `pctx setup`) identifies each project from its normalized `(host, full remote path)`:
+
+- **HTTPS and SSH equivalence**: `https://github.com/alex/api.git`, `git@github.com:alex/api.git`, and `ssh://git@github.com:2222/alex/api` all normalize to `github.com/alex/api`.
+- **Nested paths**: subgroups like `https://git.acme.example/platform/billing/api.git` keep the full path `git.acme.example/platform/billing/api`.
+- **Collision-free, path-safe filenames**: each remote maps to `<readable-slug>--<hash10>` (only `[a-z0-9-]`, bounded length for Windows and POSIX). Credentials in URLs are stripped before hashing and redacted from CLI output.
+- **No-remote fallback**: folders without an `origin` remote resolve to `local--<folder-slug>`, which cannot collide with remote IDs. Windows drive paths (`C:\repos\app.git`) are treated as local paths rather than SSH `host:path`.
+
+### Migrating existing personal projects without losing notes
+
+In `"projectIdentity": "remote"` mode, `pctx` never guesses a project by basename, so notes in `projects/api.md` will not be loaded by another remote also named `api`. Declare explicit migration aliases in `~/.pctx/config.json` for known repositories:
+
+```json
+{
+  "contextDir": "/home/alex/.pctx/context",
+  "device": "laptop",
+  "skillName": "save-context",
+  "projectIdentity": "remote",
+  "aliases": {
+    "api": "github.com/alex/api",
+    "web-app": "https://github.com/alex/web-app.git"
+  }
+}
+```
+
+With an explicit alias, only the declared remote reads the existing `projects/<alias>.md` notes and `sessions/*-<alias>-*.md` history while new sessions and notes are written under the new remote ID. Alternatively, you can rename `projects/<old>.md` directly to `projects/<new-id>.md` in your context repo and run `pctx sync`.
+
+## Isolated teams and private destinations
+
+You can optionally isolate any team by binding it to exact remotes or explicit namespaces on any Git server, with an optional dedicated private repo (`privateDir`) completely separate from your personal context repo:
+
+```json
+{
+  "contextDir": "/home/alex/.pctx/context",
+  "device": "laptop",
+  "skillName": "save-context",
+  "projectIdentity": "remote",
+  "teams": [
+    {
+      "name": "acme",
+      "url": "https://git.acme.example/platform/pctx-team.git",
+      "dir": "/home/alex/.pctx/teams/acme",
+      "isolated": true,
+      "namespaces": [
+        "git.acme.example/platform",
+        "git.acme.example/core/services"
+      ],
+      "remotes": [
+        "https://git.partner.example/shared/gateway.git"
+      ],
+      "privateDir": "/home/alex/.pctx/teams/acme-private",
+      "privateUrl": "https://git.acme.example/alex/pctx-private.git"
+    }
+  ]
+}
+```
+
+You can also pass these flags when adding a team:
+
+```sh
+pctx team add acme https://git.acme.example/platform/pctx-team.git \
+  --isolated \
+  --namespace git.acme.example/platform \
+  --remote https://git.partner.example/shared/gateway.git \
+  --private-url https://git.acme.example/alex/pctx-private.git
+```
+
+How isolated teams behave across commands:
+
+- **Automatic resolution without `projects/*.md`**: any project matching a team's `remotes` or `namespaces` resolves to that team by its remote identity even before `projects/<id>.md` exists.
+- **Strict hook isolation**: when starting a session in a personal repo, `pctx hook` never lists, refreshes, or retries pushes for isolated teams. When starting in an isolated team's repo, `pctx hook` loads and refreshes only that team and its `privateDir`, omitting your personal context and other teams.
+- **Private writes (`--private`)**: `pctx session-path --private` inside an isolated project writes only to that team's `privateDir`. If `privateDir` is missing, unavailable, or overlaps the personal repo, the team repo, or another team's repo (including symlinks and equivalent paths), `pctx` fails with no path. The save skill also keeps `## Working style` isolated: it never compares or transfers observations from an isolated team to your personal `AGENTS.md`, and skips writing private notes if no private destination is configured.
+- **Scoped `team share`, `scan`, and `sync`**: running `pctx scan` or `pctx sync` inside an isolated project operates only on that team and its `privateDir`. Passing `--project` from another `cwd` or with an unexpected value never routes an isolated project into the personal repo.
+- **Explicit maintenance from an unrelated `cwd`**: to maintain an isolated team from outside its repositories (for example from `~`), pass `--team <name>` (for example `pctx sync --team acme`, `pctx scan --team acme`, or `pctx session-path --team acme --project git.acme.example/platform/api [--private]`).
+- **Fail-safe errors**: if two teams match the same remote (ambiguous scope) or a configured scope/destination is invalid, commands fail safely without falling back to the personal repo.
+
+## Compatibility
+
+- **Legacy configs (`0.5.0` and earlier)**: configs without `projectIdentity` or team `isolated`/`remotes`/`namespaces` keep the exact legacy basename behavior.
+- **Mixed mode**: you can keep legacy basename resolution for personal projects while adding `"isolated": true` and `remotes`/`namespaces` for specific teams; projects inside those configured scopes always resolve by remote identity.
+- **Adopting `"projectIdentity": "remote"`**: existing personal `projects/*.md` notes are not matched by basename in remote mode; declare them in `"aliases"` or rename them to keep loading them.
+- **Upgrading hooks and skills**: after updating `pctx`, run `pctx install` so the updated `save-context` skill is written to Claude Code, Codex, and Antigravity.
 
 ## Commands
 
 | Command | What it does |
 | --- | --- |
-| `pctx setup <git-url> [--dir] [--device] [--author] [--skill-name]` | Clone (and seed if empty) the context repo, save config, install hook and skill |
-| `pctx team add <name> <git-url> [--dir] [--author]` | Clone (and seed if empty) a team repo and add it to the config |
+| `pctx setup <git-url> [--dir] [--device] [--author] [--skill-name] [--project-identity]` | Clone (and seed if empty) the context repo, save config, install hook and skill |
+| `pctx team add <name> <git-url> [--dir] [--author] [--isolated] [--remote] [--namespace] [--private-dir] [--private-url]` | Clone (and seed if empty) a team repo and add it to the config |
 | `pctx team share <name> [--project] [--cwd]` | Share a project with a team by creating its notes in the team repo |
 | `pctx team remove <name>` / `pctx team list` | Stop loading a team (its clone is kept) / list teams |
 | `pctx install` | Install the hook and skill into Claude Code, Codex and Antigravity, and the Codex rule for `pctx sync` |
 | `pctx uninstall` | Remove the hook, skill and Codex rule that pctx installed |
-| `pctx doctor` | Check the configuration and installation |
-| `pctx hook [--format antigravity]` | SessionStart hook: reads `{cwd}` (or Antigravity's `workspacePaths`) JSON on stdin, pulls, prints context (as `injectSteps` JSON with `--format antigravity`). Always exits 0 |
-| `pctx session-path [--project] [--cwd] [--private]` | Print a new session file path and create `sessions/` (in the team repo for a shared project; `--private` always uses your context repo) |
-| `pctx sync [-m]` | Scan, commit, pull and push the context repo and every team. Prints `synced` or `up-to-date` |
-| `pctx scan` | Scan pending changes for secrets: `clean` or findings |
+| `pctx doctor` | Check the configuration, scope rules, private destinations, and installation |
+| `pctx hook [--format antigravity]` | SessionStart hook: reads `{cwd}` (or Antigravity's `workspacePaths`) JSON on stdin, pulls the active scope, prints context (as `injectSteps` JSON with `--format antigravity`). Always exits 0 |
+| `pctx session-path [--project] [--cwd] [--team] [--private]` | Print a new session file path and create `sessions/` (in the team repo for a shared/isolated project; `--private` uses your personal repo or the isolated team's `privateDir`) |
+| `pctx sync [-m] [--cwd] [--team]` | Scan, commit, pull and push the active scope (personal + non-isolated teams, or the isolated team + its `privateDir`). Prints `synced` or `up-to-date` |
+| `pctx scan [--cwd] [--team]` | Scan pending changes in the active scope for secrets: `clean` or findings |
 
 `sync` exit codes: 0 success; 2 a possible secret was found (nothing is committed in that repo, findings are listed as `file:line (rule)` without the value); 1 pull or push failed (`local-only: ...` on stderr, the commit is kept locally). With teams, the worst result of all repos sets the exit code.
 
