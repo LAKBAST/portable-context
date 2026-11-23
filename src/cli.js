@@ -7,13 +7,15 @@ import {
   configDir,
   defaultDevice,
   defaultTeamDir,
-  detectProject,
   findTeam,
   git,
+  hasScopeRules,
   hookDeadline,
   loadConfig,
+  parseRemote,
+  redactUrl,
   refresh,
-  resolveProjectTeam,
+  resolveScope,
   saveConfig,
   sessionPath,
   setupContextRepo,
@@ -23,6 +25,8 @@ import {
   sync,
   TEAM_TEMPLATE_DIR,
   teamList,
+  validateConfig,
+  validatePrivateDestination,
 } from './context.js';
 import { install, removeSkill, status, uninstall } from './integrations.js';
 
@@ -31,9 +35,9 @@ const DEFAULT_SKILL = 'save-context';
 const USAGE = `Usage: pctx <command> [options]
 
 Commands:
-  setup <git-url> [--dir <path>] [--device <name>] [--author <name>] [--skill-name <name>]
+  setup <git-url> [--dir <path>] [--device <name>] [--author <name>] [--skill-name <name>] [--project-identity <legacy|remote>]
                  Clone or seed the context repo and install the integrations
-  team add <name> <git-url> [--dir <path>] [--author <name>]
+  team add <name> <git-url> [--dir <path>] [--author <name>] [--isolated] [--remote <url>]... [--namespace <prefix>]... [--private-dir <path>] [--private-url <url>]
                  Clone or seed a team repo shared with other people
   team share <name> [--project <name>] [--cwd <path>]
                  Share a project with a team (creates its notes in the team repo)
@@ -46,20 +50,28 @@ Commands:
   doctor         Show device, context repo and integration state
   hook [--format antigravity]
                  SessionStart hook: pull and print the context
-  session-path [--project <name>] [--cwd <path>] [--private]
+  session-path [--project <name>] [--cwd <path>] [--team <name>] [--private]
                  Print the path for a new session summary (in the team repo for a
-                 shared project; --private always uses the personal repo)
-  sync [-m <message>]
-                 Scan for secrets, commit, pull and push (the context repo and every team)
-  scan           Scan pending changes for secrets without committing`;
+                 shared project; --private uses the personal repo or the team's privateDir)
+  sync [-m <message>] [--cwd <path>] [--team <name>]
+                 Scan for secrets, commit, pull and push the active scope
+  scan [--cwd <path>] [--team <name>]
+                 Scan pending changes in the active scope for secrets without committing`;
 
 const OPTIONS = {
   dir: { type: 'string' },
   device: { type: 'string' },
   author: { type: 'string' },
   'skill-name': { type: 'string' },
+  'project-identity': { type: 'string' },
+  isolated: { type: 'boolean' },
+  remote: { type: 'string', multiple: true },
+  namespace: { type: 'string', multiple: true },
+  'private-dir': { type: 'string' },
+  'private-url': { type: 'string' },
   project: { type: 'string' },
   cwd: { type: 'string' },
+  team: { type: 'string' },
   message: { type: 'string', short: 'm' },
   private: { type: 'boolean' },
   help: { type: 'boolean', short: 'h' },
@@ -89,14 +101,20 @@ function runSetup(positionals, values) {
   const url = positionals[0];
   if (!url) throw new Error('Usage: pctx setup <git-url> [--dir <path>] [--device <name>] [--skill-name <name>]');
   const previous = loadConfig();
+  const projectIdentity = values['project-identity'] ?? previous?.projectIdentity;
+  if (projectIdentity !== undefined && projectIdentity !== 'legacy' && projectIdentity !== 'remote') {
+    throw new Error(`Invalid --project-identity "${projectIdentity}" (expected "legacy" or "remote")`);
+  }
   const author = values.author ?? previous?.author;
   const config = {
     ...previous,
     contextDir: resolve(values.dir ?? previous?.contextDir ?? join(configDir(), 'context')),
     device: slug(values.device ?? previous?.device ?? defaultDevice()),
     skillName: slug(values['skill-name'] ?? previous?.skillName ?? DEFAULT_SKILL),
+    ...(projectIdentity ? { projectIdentity } : {}),
     ...(author ? { author: slug(author) } : {}),
   };
+  validateConfig(config, git);
   const { seeded } = setupContextRepo(url, config.contextDir);
   // Saved only after install, so a refused install keeps the previous skill name.
   const installed = install(config);
@@ -108,29 +126,72 @@ function runSetup(positionals, values) {
   return 0;
 }
 
-function sameDir(a, b) {
-  const norm = (p) => resolve(p).replace(/[\\/]+$/, '').toLowerCase();
-  return norm(a) === norm(b);
+function normalizeRemoteList(values) {
+  return (values ?? []).map((item) => {
+    const parsed = parseRemote(item, { allowShorthand: true });
+    if (!parsed) throw new Error(`Invalid remote "${redactUrl(item)}"`);
+    return parsed.canonical;
+  });
 }
 
 function teamAdd([name, url], values) {
-  if (!name || !url) throw new Error('Usage: pctx team add <name> <git-url> [--dir <path>] [--author <name>]');
+  if (!name || !url) {
+    throw new Error(
+      'Usage: pctx team add <name> <git-url> [--dir <path>] [--author <name>] [--isolated] [--remote <url>]... [--namespace <prefix>]... [--private-dir <path>] [--private-url <url>]',
+    );
+  }
   const config = requireConfig();
   const teamName = slug(name);
   const existing = findTeam(config, teamName);
   const dir = resolve(values.dir ?? existing?.dir ?? defaultTeamDir(teamName));
   if (existing && existing.url !== url) {
-    throw new Error(`Team ${teamName} already points at ${existing.url}. Remove it first with: pctx team remove ${teamName}`);
+    throw new Error(
+      `Team ${teamName} already points at ${redactUrl(existing.url)}. Remove it first with: pctx team remove ${teamName}`,
+    );
   }
-  if (sameDir(dir, config.contextDir)) throw new Error('A team repo cannot use the same folder as your context repo');
-  const clash = teamList(config).find((team) => team.name !== teamName && sameDir(team.dir, dir));
-  if (clash) throw new Error(`${dir} is already used by team ${clash.name}`);
-  const { seeded } = setupContextRepo(url, dir, TEAM_TEMPLATE_DIR);
-  const team = { name: teamName, url, dir };
+  const isolated = values.isolated ?? existing?.isolated ?? false;
+  const remotes = values.remote ? normalizeRemoteList(values.remote) : existing?.remotes;
+  const namespaces = values.namespace ? values.namespace : existing?.namespaces;
+  const privateUrl = values['private-url'] ?? existing?.privateUrl;
+  const privateDir =
+    values['private-dir'] || values['private-url']
+      ? resolve(values['private-dir'] ?? existing?.privateDir ?? join(configDir(), 'teams', `${teamName}-private`))
+      : existing?.privateDir;
+
+  if (!isolated && (privateDir || privateUrl)) {
+    throw new Error('--private-dir and --private-url require --isolated');
+  }
+
+  const team = {
+    ...(existing ?? {}),
+    name: teamName,
+    url,
+    dir,
+    ...(isolated ? { isolated: true } : {}),
+    ...(remotes?.length ? { remotes } : {}),
+    ...(namespaces?.length ? { namespaces } : {}),
+    ...(privateDir ? { privateDir } : {}),
+    ...(privateUrl ? { privateUrl } : {}),
+  };
   const teams = [...teamList(config).filter((t) => t.name !== teamName), team];
   const author = values.author ?? config.author;
-  saveConfig({ ...config, teams, ...(author ? { author: slug(author) } : {}) });
+  const nextConfig = { ...config, teams, ...(author ? { author: slug(author) } : {}) };
+  validateConfig(nextConfig, git);
+
+  if (privateDir && !privateUrl) {
+    validatePrivateDestination(nextConfig, team, git);
+  }
+  const { seeded } = setupContextRepo(url, dir, TEAM_TEMPLATE_DIR);
+  let privateSeeded = false;
+  if (privateUrl && privateDir) {
+    ({ seeded: privateSeeded } = setupContextRepo(privateUrl, privateDir));
+    validatePrivateDestination(nextConfig, team, git);
+  }
+  saveConfig(nextConfig);
   console.log(`Team ${teamName}: ${dir}${seeded ? ' (seeded from the team template)' : ''}`);
+  if (privateDir) {
+    console.log(`Private repo (${teamName}): ${privateDir}${privateSeeded ? ' (seeded from the template)' : ''}`);
+  }
   console.log(`Author in team sessions: ${slug(author ?? config.device)}`);
   console.log(`Share a project with: pctx team share ${teamName} (run it inside the project's repo)`);
   return 0;
@@ -141,12 +202,34 @@ function teamShare([name], values) {
   const config = requireConfig();
   const team = findTeam(config, name);
   if (!team) throw new Error(`No team named ${slug(name)}. Add it with: pctx team add <name> <git-url>`);
-  const project = values.project ? slug(values.project) : detectProject(resolve(values.cwd ?? process.cwd()));
-  if (!project) throw new Error('Could not detect the project; pass --project <name>');
-  const { file, created } = shareProject(config, team, project);
-  console.log(`${created ? 'Shared' : 'Already shared'}: ${project} in team ${team.name} (${file})`);
-  if (existsSync(join(config.contextDir, 'projects', `${project}.md`))) {
-    console.log(`Your private notes in ${join(config.contextDir, 'projects', `${project}.md`)} stay private; copy to the team file only what the team should read.`);
+  const cwd = resolve(values.cwd ?? process.cwd());
+  const resolved = resolveScope(config, {
+    cwd,
+    project: values.project,
+    teamName: team.name,
+    strictCwd: Boolean(values.cwd),
+  });
+  if (resolved.conflict) throw new Error(resolved.conflict);
+  if (!resolved.projectId) throw new Error('Could not detect the project; pass --project <name>');
+  if (!existsSync(join(team.dir, '.git'))) {
+    throw new Error(`Team ${team.name} repo is missing at ${team.dir}`);
+  }
+  const { file, created } = shareProject(config, team, resolved.projectId);
+  console.log(`${created ? 'Shared' : 'Already shared'}: ${resolved.projectId} in team ${team.name} (${file})`);
+  if (team.isolated) {
+    if (team.privateDir && existsSync(join(team.privateDir, 'projects', `${resolved.projectId}.md`))) {
+      const priv = join(team.privateDir, 'projects', `${resolved.projectId}.md`);
+      console.log(`Your private notes in ${priv} stay private; copy to the team file only what the team should read.`);
+    }
+  } else {
+    const personalFile = join(config.contextDir, 'projects', `${resolved.projectId}.md`);
+    const aliasFile = resolved.alias ? join(config.contextDir, 'projects', `${resolved.alias}.md`) : null;
+    const foundPersonal = existsSync(personalFile) ? personalFile : aliasFile && existsSync(aliasFile) ? aliasFile : null;
+    if (foundPersonal) {
+      console.log(
+        `Your private notes in ${foundPersonal} stay private; copy to the team file only what the team should read.`,
+      );
+    }
   }
   if (created) console.log('Run pctx sync to publish it to the team.');
   return 0;
@@ -163,12 +246,20 @@ function teamRemove([name]) {
 }
 
 function teamListCommand() {
-  const teams = teamList(requireConfig());
+  const config = requireConfig();
+  const teams = teamList(config);
   if (!teams.length) {
     console.log('No teams. Add one with: pctx team add <name> <git-url>');
     return 0;
   }
-  for (const team of teams) console.log(`${team.name}: ${redactUrl(team.url)} (${team.dir})`);
+  for (const team of teams) {
+    const tags = [];
+    if (team.isolated) tags.push('isolated');
+    if (hasScopeRules(team)) tags.push('scoped');
+    if (team.privateDir) tags.push(`private: ${team.privateDir}`);
+    const suffix = tags.length ? ` [${tags.join(', ')}]` : '';
+    console.log(`${team.name}: ${redactUrl(team.url)} (${team.dir})${suffix}`);
+  }
   return 0;
 }
 
@@ -198,20 +289,40 @@ function runUninstall() {
   return 0;
 }
 
-function redactUrl(url) {
-  return url.replace(/\/\/[^/@\s]+@/, '//***@');
-}
-
 function runDoctor() {
   const config = requireConfig();
   const remote = git(config.contextDir, ['config', '--get', 'remote.origin.url']);
   console.log(`Device: ${config.device}`);
   console.log(`Context dir: ${config.contextDir}`);
   console.log(`Remote: ${remote.ok ? redactUrl(remote.stdout.trim()) : '(not found)'}`);
+  console.log(`Project identity: ${config.projectIdentity ?? 'legacy'}`);
+  const aliasCount = Object.keys(config.aliases ?? {}).length;
+  if (aliasCount) console.log(`Aliases: ${aliasCount}`);
   if (config.author) console.log(`Author: ${config.author}`);
+  try {
+    validateConfig(config, git);
+  } catch (err) {
+    console.log(`Config problem: ${err.message}`);
+  }
   for (const team of teamList(config)) {
     const found = existsSync(join(team.dir, '.git'));
-    console.log(`Team ${team.name}: ${redactUrl(team.url)} (${found ? team.dir : `missing clone at ${team.dir}`})`);
+    const flags = [];
+    if (team.isolated) flags.push('isolated');
+    if (team.remotes?.length) flags.push(`${team.remotes.length} remote(s)`);
+    if (team.namespaces?.length) flags.push(`${team.namespaces.length} namespace(s)`);
+    const tagText = flags.length ? ` [${flags.join(', ')}]` : '';
+    console.log(
+      `Team ${team.name}: ${redactUrl(team.url)} (${found ? team.dir : `missing clone at ${team.dir}`})${tagText}`,
+    );
+    if (team.privateDir) {
+      let privState = 'ok';
+      try {
+        validatePrivateDestination(config, team, git);
+      } catch (err) {
+        privState = `invalid: ${err.message}`;
+      }
+      console.log(`Team ${team.name} private: ${team.privateDir} (${privState})`);
+    }
   }
   const state = (on) => (on ? 'installed' : 'missing');
   for (const item of status(config)) {
@@ -264,17 +375,41 @@ function runHook(args) {
     if (config) {
       const deadline = hookDeadline();
       const workDir = hookWorkDir(readHookInput(), antigravity);
-      const personal = refresh(config.contextDir, deadline);
-      // The team that owns this project goes first, so a slow team elsewhere cannot starve it.
-      const { team: owner } = resolveProjectTeam(config, detectProject(workDir));
-      const teams = [...teamList(config)].sort((a, b) => (b.name === owner?.name) - (a.name === owner?.name));
-      const teamResults = {};
-      for (const team of teams) {
+      const resolved = resolveScope(config, { cwd: workDir, allowConflict: true });
+
+      if (resolved.scopeKind === 'isolated' && resolved.isolatedTeam && !resolved.conflict) {
+        const team = resolved.isolatedTeam;
+        const teamResults = {};
         teamResults[team.name] = existsSync(join(team.dir, '.git'))
           ? refresh(team.dir, deadline)
           : { ok: false, message: `no clone at ${team.dir}; run pctx team add again` };
+        let privateResult = null;
+        if (team.privateDir) {
+          try {
+            validatePrivateDestination(config, team, git);
+            privateResult = refresh(team.privateDir, deadline);
+          } catch (err) {
+            privateResult = { ok: false, unusable: true, message: err.message };
+          }
+        }
+        text = buildContext(config, workDir, null, teamResults, { resolved, privateResult });
+      } else if (resolved.isolatedTeam && resolved.conflict) {
+        text = `Portable context unavailable: ${resolved.conflict}`;
+      } else {
+        const personal = refresh(config.contextDir, deadline);
+        // Personal hook never enumerates, refreshes, or pushes isolated teams.
+        const nonIsolated = teamList(config).filter((t) => !t.isolated);
+        const teams = [...nonIsolated].sort(
+          (a, b) => (b.name === resolved.team?.name) - (a.name === resolved.team?.name),
+        );
+        const teamResults = {};
+        for (const team of teams) {
+          teamResults[team.name] = existsSync(join(team.dir, '.git'))
+            ? refresh(team.dir, deadline)
+            : { ok: false, message: `no clone at ${team.dir}; run pctx team add again` };
+        }
+        text = buildContext(config, workDir, personal, teamResults, { resolved });
       }
-      text = buildContext(config, workDir, personal, teamResults);
     }
   } catch (err) {
     text = `Portable context unavailable: ${String(err?.message ?? err).split(/\r?\n/)[0]}`;
@@ -285,20 +420,66 @@ function runHook(args) {
 
 function runSessionPath(values) {
   const config = requireConfig();
-  const project = slug(values.project ?? detectProject(resolve(values.cwd ?? process.cwd())) ?? 'general');
-  // --private always points at the personal repo, even for a shared project.
-  const { team, conflict } = values.private ? { team: null } : resolveProjectTeam(config, project);
-  if (conflict) throw new Error(conflict);
-  const file = sessionPath(config, project, new Date(), team);
+  const cwd = resolve(values.cwd ?? process.cwd());
+  const resolved = resolveScope(config, {
+    cwd,
+    project: values.project,
+    teamName: values.team,
+    strictCwd: Boolean(values.cwd),
+  });
+  if (resolved.conflict) throw new Error(resolved.conflict);
+  const project = resolved.projectId ?? (resolved.mode === 'legacy' && !values.team ? 'general' : null);
+  if (!project) {
+    throw new Error('Could not resolve project; pass --cwd inside a project repo or --project <remote-or-id>');
+  }
+
+  let file;
+  if (resolved.scopeKind === 'isolated') {
+    const team = resolved.isolatedTeam;
+    if (!existsSync(join(team.dir, '.git'))) {
+      throw new Error(`Team ${team.name} repo is not available at ${team.dir}`);
+    }
+    if (values.private) {
+      const targetDir = validatePrivateDestination(config, team, git);
+      file = sessionPath(config, project, new Date(), team, targetDir);
+    } else {
+      file = sessionPath(config, project, new Date(), team);
+    }
+  } else {
+    const targetDir = values.private ? config.contextDir : null;
+    const team = values.private ? null : resolved.team;
+    file = sessionPath(config, project, new Date(), team, targetDir);
+  }
   mkdirSync(dirname(file), { recursive: true });
   console.log(file);
   return 0;
 }
 
-function repos(config) {
+function targetRepos(config, values) {
+  const cwd = resolve(values.cwd ?? process.cwd());
+  const resolved = resolveScope(config, {
+    cwd,
+    teamName: values.team,
+    strictCwd: Boolean(values.cwd),
+  });
+  if (resolved.conflict) throw new Error(resolved.conflict);
+  if (resolved.scopeKind === 'isolated') {
+    const team = resolved.isolatedTeam;
+    const list = [{ label: `team ${team.name}`, dir: team.dir, team }];
+    if (team.privateDir) {
+      const privDir = validatePrivateDestination(config, team, git);
+      list.push({ label: `private ${team.name}`, dir: privDir, privateOf: team });
+    }
+    return list;
+  }
+  if (values.team && resolved.team) {
+    return [{ label: `team ${resolved.team.name}`, dir: resolved.team.dir, team: resolved.team }];
+  }
   return [
     { label: 'context', dir: config.contextDir },
-    ...teamList(config).map((team) => ({ label: `team ${team.name}`, dir: team.dir })),
+    ...teamList(config)
+      .filter((t) => !t.isolated)
+      .map((team) => ({ label: `team ${team.name}`, dir: team.dir, team })),
   ];
 }
 
@@ -318,11 +499,11 @@ function reportSync(result, prefix) {
 
 function runSync(values) {
   const config = requireConfig();
-  const all = repos(config);
+  const all = targetRepos(config, values);
   let code = 0;
-  for (const { label, dir } of all) {
+  for (const { label, dir, team } of all) {
     const prefix = all.length > 1 ? `${label}: ` : '';
-    const message = values.message || (label === 'context' ? undefined : `context: update from ${config.author ?? config.device}`);
+    const message = values.message || (team ? `context: update from ${config.author ?? config.device}` : undefined);
     const result = existsSync(join(dir, '.git'))
       ? sync(config, message, dir)
       : { status: 'error', message: `no clone at ${dir}` };
@@ -331,8 +512,12 @@ function runSync(values) {
   return code;
 }
 
-function runScan() {
-  const all = repos(requireConfig()).filter(({ dir }) => existsSync(join(dir, '.git')));
+function runScan(values) {
+  const config = requireConfig();
+  const targets = targetRepos(config, values);
+  const missing = targets.find(({ team, dir }) => team && !existsSync(join(dir, '.git')));
+  if (missing) throw new Error(`no clone at ${missing.dir}`);
+  const all = targets.filter(({ dir }) => existsSync(join(dir, '.git')));
   let code = 0;
   for (const { label, dir } of all) {
     const prefix = all.length > 1 ? `${label}: ` : '';
@@ -369,7 +554,7 @@ function dispatch(command, positionals, values) {
     case 'sync':
       return runSync(values);
     case 'scan':
-      return runScan();
+      return runScan(values);
     default:
       console.error(`Unknown command: ${command}\n\n${USAGE}`);
       return 1;
