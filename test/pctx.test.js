@@ -2036,3 +2036,343 @@ test('stale-save reminder checks calendar days across visible stores, ignores in
   const outOther = buildContext(cfg(), otherRepo, { ok: true }, {}, { now });
   assert.ok(!outOther.includes('REMINDER:'), 'legacy alias save must not leak to another remote with same basename');
 });
+
+// ---------------------------------------------------------------- hook refresh interval & compact mode
+
+function hookCacheDir(device) {
+  return path.join(device.pctxHome, 'hook-refresh');
+}
+
+function hookCacheFiles(device) {
+  const dir = hookCacheDir(device);
+  if (!fs.existsSync(dir)) return [];
+  return fs.readdirSync(dir).filter((name) => name.endsWith('.json')).map((name) => path.join(dir, name));
+}
+
+function hookWithInput(device, payload, extraArgs = []) {
+  return pctx(device, ['hook', ...extraArgs], { input: JSON.stringify(payload) });
+}
+
+test('hook caches successful refresh per clone, skips within interval, expires without sleeping, and keeps sync manual', () => {
+  const sb = makeSandbox();
+  const a = makeDevice(sb, 'laptop', { antigravity: true });
+  const b = makeDevice(sb, 'desktop');
+  setup(a, sb);
+  setup(b, sb);
+
+  const projA = projectDir(a, 'alpha');
+  const projB = projectDir(b, 'alpha');
+
+  // 1) Initial startup hook refreshes and writes a minimal cache entry outside the versioned repo.
+  const hStart = hookWithInput(a, { cwd: projA, source: 'startup' });
+  assert.equal(hStart.status, 0, hStart.stderr);
+  assert.doesNotMatch(hStart.stdout, /WARNING:/);
+  const filesA = hookCacheFiles(a);
+  assert.equal(filesA.length, 1);
+  const cacheData = readJson(filesA[0]);
+  assert.deepEqual(Object.keys(cacheData), ['refreshedAt']);
+  assert.ok(Number.isFinite(cacheData.refreshedAt) && cacheData.refreshedAt <= Date.now());
+  const rawCache = fs.readFileSync(filesA[0], 'utf8');
+  assert.ok(!rawCache.includes(sb.remote), 'cache must not store remote URLs');
+
+  // 2) Device B pushes a new note; Device A's warm cache skips pull on resume, clear, missing source, and Antigravity.
+  write(path.join(b.context, 'projects', 'alpha.md'), '# alpha\nREMOTE-CHANGE-1\n');
+  assert.equal(pctx(b, ['sync']).status, 0);
+
+  for (const payload of [
+    { cwd: projA, source: 'resume' },
+    { cwd: projA, source: 'clear' },
+    { cwd: projA },
+  ]) {
+    const hWarm = hookWithInput(a, payload);
+    assert.equal(hWarm.status, 0);
+    assert.doesNotMatch(hWarm.stdout, /WARNING:/);
+    assert.ok(!hWarm.stdout.includes('REMOTE-CHANGE-1'), `warm cache should skip pull for ${JSON.stringify(payload)}`);
+  }
+
+  const hAgWarm = hookWithInput(a, { conversationId: 'c1', workspacePaths: [projA] }, ['--format', 'antigravity']);
+  assert.equal(hAgWarm.status, 0);
+  const agText = JSON.parse(hAgWarm.stdout).injectSteps[0].systemMessage.systemMessage;
+  assert.ok(agText.includes('Current project: alpha'));
+  assert.ok(!agText.includes('REMOTE-CHANGE-1'), 'Antigravity warm cache should skip pull');
+
+  // 3) Another clone (Device B) and a second clone directory under the same PCTX_HOME have no cache and refresh immediately.
+  const hB = hookWithInput(b, { cwd: projB, source: 'startup' });
+  assert.equal(hB.status, 0);
+  assert.ok(hB.stdout.includes('REMOTE-CHANGE-1'));
+
+  const altClone = path.join(a.pctxHome, 'context-alt');
+  git(['clone', '-q', sb.remote, altClone]);
+  // Rewind altClone by 1 commit so we can verify hook pulls into this separate clone.
+  git(['-C', altClone, 'reset', '--hard', 'HEAD~1']);
+  updateConfig(a, (cfg) => { cfg.contextDir = altClone; });
+  const hAlt = hookWithInput(a, { cwd: projA, source: 'startup' });
+  assert.equal(hAlt.status, 0);
+  assert.ok(hAlt.stdout.includes('REMOTE-CHANGE-1'), 'second clone directory must not reuse first clone cache');
+  assert.equal(hookCacheFiles(a).length, 2, 'each clone gets its own cache key');
+  updateConfig(a, (cfg) => { cfg.contextDir = a.context; });
+
+  // 4) Manual pctx sync ignores the warm hook cache and pulls immediately.
+  const syncRes = pctx(a, ['sync']);
+  assert.equal(syncRes.status, 0, syncRes.stderr);
+  assert.match(syncRes.stdout, /up-to-date/);
+  assert.ok(fs.readFileSync(path.join(a.context, 'projects', 'alpha.md'), 'utf8').includes('REMOTE-CHANGE-1'));
+
+  // 5) Simulated expiration without sleeping triggers a refresh on the next hook.
+  write(path.join(b.context, 'projects', 'alpha.md'), '# alpha\nREMOTE-CHANGE-2\n');
+  assert.equal(pctx(b, ['sync']).status, 0);
+  assert.ok(!hookWithInput(a, { cwd: projA, source: 'resume' }).stdout.includes('REMOTE-CHANGE-2'));
+
+  const expiredAt = Date.now() - 125_000;
+  write(filesA[0], `${JSON.stringify({ refreshedAt: expiredAt })}\n`);
+  const hExpired = hookWithInput(a, { cwd: projA, source: 'resume' });
+  assert.equal(hExpired.status, 0);
+  assert.ok(hExpired.stdout.includes('REMOTE-CHANGE-2'), 'expired cache must refresh');
+  assert.ok(readJson(filesA[0]).refreshedAt > expiredAt, 'refreshedAt should be updated after refresh');
+
+  // Matcher remains unchanged for Claude Code and Codex.
+  assert.equal(readJson(path.join(a.claude, 'settings.json')).hooks.SessionStart[0].matcher, 'startup|resume|clear|compact');
+  assert.equal(readJson(path.join(a.codex, 'hooks.json')).hooks.SessionStart[0].matcher, 'startup|resume|clear|compact');
+});
+
+test('hook does not cache errors, recovers from corrupt/future/unwritable cache, and never exposes credentials', () => {
+  const sb = makeSandbox();
+  const a = makeDevice(sb, 'laptop');
+  const b = makeDevice(sb, 'desktop');
+  setup(a, sb);
+  setup(b, sb);
+
+  // 1) Offline pull failure is not cached; next online hook retries immediately.
+  offline(sb);
+  const hOff = hookWithInput(a, { cwd: a.work, source: 'startup' });
+  assert.equal(hOff.status, 0);
+  assert.match(hOff.stdout, /WARNING: the context may be out of date/);
+  assert.equal(hookCacheFiles(a).length, 0, 'failed pull must not create a cache entry');
+
+  online(sb);
+  write(path.join(b.context, 'projects', 'retry.md'), '# retry\nRETRY-OK\n');
+  assert.equal(pctx(b, ['sync']).status, 0);
+  const hRetry = hookWithInput(a, { cwd: a.work, source: 'startup' });
+  assert.equal(hRetry.status, 0);
+  assert.doesNotMatch(hRetry.stdout, /WARNING:/);
+  assert.ok(fs.existsSync(path.join(a.context, 'projects', 'retry.md')));
+  const cacheFiles = hookCacheFiles(a);
+  assert.equal(cacheFiles.length, 1);
+
+  // 2) Pull ok + pending push failure is also not cached; next hook retries the pending push.
+  write(path.join(a.context, 'projects', 'pending.md'), '# pending\n');
+  git(['-C', a.context, 'add', '-A']);
+  git(['-C', a.context, 'commit', '-q', '-m', 'pending commit']);
+  const preReceive = path.join(sb.remote, 'hooks', 'pre-receive');
+  write(preReceive, '#!/bin/sh\nexit 1\n');
+  fs.chmodSync(preReceive, 0o755);
+
+  const expiredAt = Date.now() - 125_000;
+  write(cacheFiles[0], `${JSON.stringify({ refreshedAt: expiredAt })}\n`);
+  const hPushFail = hookWithInput(a, { cwd: a.work, source: 'startup' });
+  assert.equal(hPushFail.status, 0);
+  assert.match(hPushFail.stdout, /WARNING: the context may be out of date \(Could not push:/);
+  assert.equal(readJson(cacheFiles[0]).refreshedAt, expiredAt, 'failed push must not refresh timestamp');
+
+  fs.rmSync(preReceive);
+  const hPushOk = hookWithInput(a, { cwd: a.work, source: 'startup' });
+  assert.equal(hPushOk.status, 0);
+  assert.doesNotMatch(hPushOk.stdout, /WARNING:/);
+  assert.ok(remoteFiles(sb).includes('projects/pending.md'), 'pending push retried when prior failure was not cached');
+  assert.ok(readJson(cacheFiles[0]).refreshedAt > expiredAt);
+
+  // 3) Corrupt JSON and future timestamps do not block the hook and get replaced on refresh.
+  write(path.join(b.context, 'projects', 'corrupt.md'), '# corrupt\n');
+  assert.equal(pctx(b, ['sync']).status, 0);
+  write(cacheFiles[0], '{not valid json');
+  assert.equal(hookWithInput(a, { cwd: a.work, source: 'startup' }).status, 0);
+  assert.ok(fs.existsSync(path.join(a.context, 'projects', 'corrupt.md')));
+  assert.ok(readJson(cacheFiles[0]).refreshedAt <= Date.now());
+
+  write(path.join(b.context, 'projects', 'future.md'), '# future\n');
+  assert.equal(pctx(b, ['sync']).status, 0);
+  write(cacheFiles[0], `${JSON.stringify({ refreshedAt: Date.now() + 600_000 })}\n`);
+  assert.equal(hookWithInput(a, { cwd: a.work, source: 'startup' }).status, 0);
+  assert.ok(fs.existsSync(path.join(a.context, 'projects', 'future.md')));
+  assert.ok(readJson(cacheFiles[0]).refreshedAt <= Date.now());
+
+  // 4) Unwritable cache directory (blocked by a regular file) never blocks the hook.
+  fs.rmSync(hookCacheDir(a), { recursive: true, force: true });
+  write(hookCacheDir(a), 'not-a-directory\n');
+  const hUnwritable = hookWithInput(a, { cwd: a.work, source: 'startup' });
+  assert.equal(hUnwritable.status, 0);
+  assert.ok(hUnwritable.stdout.includes('# Portable context'));
+  assert.doesNotMatch(hUnwritable.stdout, /WARNING:/);
+  fs.rmSync(hookCacheDir(a), { force: true });
+
+  // 5) Remote URL credentials are never stored in cache filenames or contents.
+  const secretToken = 'tok_super_secret_987654';
+  git(['-C', a.context, 'remote', 'set-url', 'origin', `https://bot:${secretToken}@127.0.0.1:1/ctx.git`]);
+  const hCredErr = hookWithInput(a, { cwd: a.work, source: 'startup' });
+  assert.equal(hCredErr.status, 0);
+  assert.ok(!hCredErr.stdout.includes(secretToken));
+  for (const file of hookCacheFiles(a)) {
+    assert.ok(!file.includes(secretToken));
+    assert.ok(!fs.readFileSync(file, 'utf8').includes(secretToken));
+  }
+});
+
+test('hook source="compact" skips pull, fetch, and push even with empty cache and hookRefreshSeconds 0', () => {
+  const sb = makeSandbox();
+  const teamRemote = makeRemote(sb, 'studio');
+  const a = makeDevice(sb, 'laptop', { antigravity: true });
+  const b = makeDevice(sb, 'desktop');
+  setup(a, sb, ['--author', 'alice']);
+  setup(b, sb, ['--author', 'bob']);
+  teamAdd(a, 'studio', teamRemote);
+  teamAdd(b, 'studio', teamRemote);
+
+  // Set hookRefreshSeconds to 0 and ensure cache is completely empty.
+  updateConfig(a, (cfg) => { cfg.hookRefreshSeconds = 0; });
+  assert.equal(hookCacheFiles(a).length, 0);
+
+  // Remote has newer commits from B in both personal and team repos.
+  write(path.join(b.context, 'projects', 'app.md'), '# app\nREMOTE-PERSONAL-NEW\n');
+  const bTeamDir = path.join(b.pctxHome, 'teams', 'studio');
+  write(path.join(bTeamDir, 'projects', 'shared.md'), '# shared\nREMOTE-TEAM-NEW\n');
+  assert.equal(pctx(b, ['sync']).status, 0);
+
+  // A has local unpushed commits in both personal and team repos, plus local notes.
+  const aTeamDir = path.join(a.pctxHome, 'teams', 'studio');
+  write(path.join(a.context, 'projects', 'local-personal.md'), '# local-personal\nLOCAL-PERSONAL-UNPUSHED\n');
+  git(['-C', a.context, 'add', '-A']);
+  git(['-C', a.context, 'commit', '-q', '-m', 'local personal commit']);
+  write(path.join(aTeamDir, 'projects', 'local-team.md'), '# local-team\n');
+  git(['-C', aTeamDir, 'add', '-A']);
+  git(['-C', aTeamDir, 'commit', '-q', '-m', 'local team commit']);
+
+  const persRemoteHeadBefore = remoteHead(sb);
+  const teamRemoteHeadBefore = git(['--git-dir', teamRemote, 'rev-parse', 'main']).stdout.trim();
+
+  // Compact runs local-only: no pull, no fetch, no push, no cache written.
+  const appDir = projectDir(a, 'local-personal');
+  const hCompact = hookWithInput(a, { cwd: appDir, source: 'compact' });
+  assert.equal(hCompact.status, 0, hCompact.stderr);
+  assert.ok(hCompact.stdout.includes('LOCAL-PERSONAL-UNPUSHED'));
+  assert.ok(!hCompact.stdout.includes('REMOTE-PERSONAL-NEW'));
+  assert.ok(!hCompact.stdout.includes('REMOTE-TEAM-NEW'));
+  assert.doesNotMatch(hCompact.stdout, /WARNING:/);
+  assert.equal(remoteHead(sb), persRemoteHeadBefore, 'compact must not push personal commits');
+  assert.equal(git(['--git-dir', teamRemote, 'rev-parse', 'main']).stdout.trim(), teamRemoteHeadBefore, 'compact must not push team commits');
+  assert.equal(hookCacheFiles(a).length, 0, 'compact must not populate refresh cache');
+
+  // Even Antigravity format respects source="compact" if provided, while omitting source refreshes when interval is 0.
+  const hAgCompact = hookWithInput(a, { workspacePaths: [appDir], source: 'compact' }, ['--format', 'antigravity']);
+  assert.equal(hAgCompact.status, 0);
+  const agCompactText = JSON.parse(hAgCompact.stdout).injectSteps[0].systemMessage.systemMessage;
+  assert.ok(agCompactText.includes('LOCAL-PERSONAL-UNPUSHED'));
+  assert.equal(remoteHead(sb), persRemoteHeadBefore);
+
+  // With hookRefreshSeconds: 0, normal startup pulls & pushes; consecutive normal calls also refresh.
+  const hNormal = hookWithInput(a, { cwd: appDir, source: 'startup' });
+  assert.equal(hNormal.status, 0);
+  assert.doesNotMatch(hNormal.stdout, /WARNING:/);
+  assert.ok(fs.existsSync(path.join(a.context, 'projects', 'app.md')));
+  assert.notEqual(remoteHead(sb), persRemoteHeadBefore, 'startup with hookRefreshSeconds 0 pushes pending commit');
+  assert.notEqual(git(['--git-dir', teamRemote, 'rev-parse', 'main']).stdout.trim(), teamRemoteHeadBefore);
+
+  write(path.join(b.context, 'projects', 'zero.md'), '# zero\n');
+  assert.equal(pctx(b, ['sync']).status, 0);
+  assert.equal(hookWithInput(a, { cwd: appDir, source: 'resume' }).status, 0);
+  assert.ok(fs.existsSync(path.join(a.context, 'projects', 'zero.md')), 'hookRefreshSeconds 0 disables interval between normal hooks');
+});
+
+test('isolated scope keeps per-repo timestamps separate, stays isolated on compact/expiration, and validates hookRefreshSeconds', () => {
+  const sb = makeSandbox();
+  const studioRemote = makeRemote(sb, 'studio-team');
+  const acmeRemote = makeRemote(sb, 'acme-team');
+  const acmePrivRemote = makeRemote(sb, 'acme-priv');
+  const alex = makeDevice(sb, 'alex-laptop');
+  const sam = makeDevice(sb, 'sam-pc');
+
+  setup(alex, sb, ['--author', 'alex', '--project-identity', 'remote']);
+  setup(sam, sb, ['--author', 'sam', '--project-identity', 'remote']);
+  teamAdd(alex, 'studio', studioRemote);
+  teamAdd(alex, 'acme', acmeRemote, [
+    '--isolated',
+    '--namespace', 'git.acme.example/platform',
+    '--private-url', acmePrivRemote,
+  ]);
+  teamAdd(sam, 'studio', studioRemote);
+  teamAdd(sam, 'acme', acmeRemote, ['--isolated', '--namespace', 'git.acme.example/platform']);
+
+  const persProj = makeProjectRepo(alex, 'solo', 'https://github.com/alex/solo.git');
+  const corpProj = makeProjectRepo(alex, 'payments', 'https://git.acme.example/platform/payments.git');
+
+  // 1) Personal hook warms personal + studio caches, never touching isolated acme/acme-private.
+  assert.equal(hookWithInput(alex, { cwd: persProj, source: 'startup' }).status, 0);
+  const persAndStudioCaches = new Set(hookCacheFiles(alex));
+  assert.equal(persAndStudioCaches.size, 2);
+
+  // Sam updates both studio and acme remotes.
+  const samStudioDir = path.join(sam.pctxHome, 'teams', 'studio');
+  const samAcmeDir = path.join(sam.pctxHome, 'teams', 'acme');
+  write(path.join(samStudioDir, 'AGENTS.md'), 'SAM-STUDIO-PROFILE\n');
+  write(path.join(samAcmeDir, 'AGENTS.md'), 'SAM-ACME-PROFILE\n');
+  assert.equal(pctx(sam, ['sync', '--cwd', sam.work]).status, 0);
+  assert.equal(pctx(sam, ['sync', '--team', 'acme']).status, 0);
+
+  // Backdate personal + studio caches so personal hook refreshes only personal + studio, never acme.
+  const acmeHeadBefore = git(['--git-dir', acmeRemote, 'rev-parse', 'main']).stdout.trim();
+  const acmeDir = path.join(alex.pctxHome, 'teams', 'acme');
+  const acmePrivDir = path.join(alex.pctxHome, 'teams', 'acme-private');
+  write(path.join(acmeDir, 'projects', 'unpushed-acme.md'), '# unpushed\n');
+  git(['-C', acmeDir, 'add', '-A']);
+  git(['-C', acmeDir, 'commit', '-q', '-m', 'unpushed acme']);
+
+  for (const file of persAndStudioCaches) {
+    write(file, `${JSON.stringify({ refreshedAt: Date.now() - 125_000 })}\n`);
+  }
+  const hPersExpired = hookWithInput(alex, { cwd: persProj, source: 'startup' });
+  assert.equal(hPersExpired.status, 0);
+  assert.ok(fs.readFileSync(path.join(alex.pctxHome, 'teams', 'studio', 'AGENTS.md'), 'utf8').includes('SAM-STUDIO-PROFILE'));
+  assert.equal(git(['--git-dir', acmeRemote, 'rev-parse', 'main']).stdout.trim(), acmeHeadBefore, 'expired personal hook must not push isolated team');
+  assert.equal(hookCacheFiles(alex).length, 2, 'expired personal hook must not cache isolated repos');
+
+  // 2) Compact inside isolated corpProj outputs local isolated context without pulling or pushing acme/acme-priv or personal.
+  write(path.join(acmePrivDir, 'projects', 'unpushed-priv.md'), '# unpushed priv\n');
+  git(['-C', acmePrivDir, 'add', '-A']);
+  git(['-C', acmePrivDir, 'commit', '-q', '-m', 'unpushed priv']);
+  const privHeadBefore = git(['--git-dir', acmePrivRemote, 'rev-parse', 'main']).stdout.trim();
+
+  updateConfig(alex, (cfg) => { cfg.hookRefreshSeconds = 0; });
+  const hCorpCompact = hookWithInput(alex, { cwd: corpProj, source: 'compact' });
+  assert.equal(hCorpCompact.status, 0);
+  assert.ok(hCorpCompact.stdout.includes('# Portable context (team acme)'));
+  assert.ok(!hCorpCompact.stdout.includes('SAM-ACME-PROFILE'), 'compact in isolated scope must not pull');
+  assert.ok(!hCorpCompact.stdout.includes(alex.context));
+  assert.equal(git(['--git-dir', acmeRemote, 'rev-parse', 'main']).stdout.trim(), acmeHeadBefore, 'compact must not push isolated team');
+  assert.equal(git(['--git-dir', acmePrivRemote, 'rev-parse', 'main']).stdout.trim(), privHeadBefore, 'compact must not push isolated private');
+
+  // 3) Normal isolated hook refreshes acme & acme-private independently, and warm cache still validates privateDir locally.
+  updateConfig(alex, (cfg) => { delete cfg.hookRefreshSeconds; });
+  const hCorp = hookWithInput(alex, { cwd: corpProj, source: 'startup' });
+  assert.equal(hCorp.status, 0);
+  assert.ok(hCorp.stdout.includes('SAM-ACME-PROFILE'));
+  assert.notEqual(git(['--git-dir', acmeRemote, 'rev-parse', 'main']).stdout.trim(), acmeHeadBefore);
+  assert.notEqual(git(['--git-dir', acmePrivRemote, 'rev-parse', 'main']).stdout.trim(), privHeadBefore);
+  assert.equal(hookCacheFiles(alex).length, 4, 'personal, studio, acme, and acme-private each have distinct cache files');
+
+  // Warm isolated hook still runs local privateDir validation.
+  fs.rmSync(acmePrivDir, { recursive: true, force: true });
+  const hBrokenPriv = hookWithInput(alex, { cwd: corpProj, source: 'resume' });
+  assert.equal(hBrokenPriv.status, 0);
+  assert.match(hBrokenPriv.stdout, /WARNING: private acme may be out of date/);
+
+  // 4) Invalid hookRefreshSeconds fails cleanly in doctor, sync, and hook (hook still exits 0).
+  updateConfig(alex, (cfg) => { cfg.hookRefreshSeconds = -1; });
+  const doc = pctx(alex, ['doctor']);
+  assert.equal(doc.status, 0);
+  assert.match(doc.stdout, /Config problem: Invalid hookRefreshSeconds/);
+  const badSync = pctx(alex, ['sync', '--cwd', persProj]);
+  assert.equal(badSync.status, 1);
+  assert.match(badSync.stderr, /Invalid hookRefreshSeconds/);
+  const badHook = hookWithInput(alex, { cwd: persProj, source: 'startup' });
+  assert.equal(badHook.status, 0);
+  assert.match(badHook.stdout, /^Portable context unavailable: Invalid hookRefreshSeconds/);
+});
