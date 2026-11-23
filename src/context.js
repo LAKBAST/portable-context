@@ -285,7 +285,7 @@ export function hookRefresh(
     return { ok: true, skipped: true };
   }
   const result = refresh(dir, deadline, { isolated });
-  if (result.ok) writeRefreshTimestamp(dir, now ?? Date.now());
+  if (result.ok && intervalSeconds > 0) writeRefreshTimestamp(dir, now ?? Date.now());
   return result;
 }
 

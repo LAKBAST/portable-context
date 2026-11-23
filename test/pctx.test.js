@@ -2280,6 +2280,7 @@ test('hook source="compact" skips pull, fetch, and push even with empty cache an
   assert.equal(pctx(b, ['sync']).status, 0);
   assert.equal(hookWithInput(a, { cwd: appDir, source: 'resume' }).status, 0);
   assert.ok(fs.existsSync(path.join(a.context, 'projects', 'zero.md')), 'hookRefreshSeconds 0 disables interval between normal hooks');
+  assert.ok(!fs.existsSync(path.join(a.pctxHome, 'hook-refresh')), 'a disabled interval does not write a cache');
 });
 
 test('isolated scope keeps per-repo timestamps separate, stays isolated on compact/expiration, and validates hookRefreshSeconds', () => {
