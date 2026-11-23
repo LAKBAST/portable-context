@@ -114,14 +114,15 @@ Your profile, your other projects and their sessions never go to a team repo. Yo
 
 When two repositories share the same basename across different hosts or namespaces (for example `https://github.com/alex/api.git` and `https://git.acme.example/platform/api.git`), basename-only matching collides. Setting `"projectIdentity": "remote"` in `~/.pctx/config.json` (or passing `--project-identity remote` to `pctx setup`) identifies each project from its normalized `(host, full remote path)`:
 
-- **HTTPS and SSH equivalence**: `https://github.com/alex/api.git`, `git@github.com:alex/api.git`, and `ssh://git@github.com:2222/alex/api` all normalize to `github.com/alex/api`.
+- **HTTPS and SSH equivalence**: for default ports, `https://github.com/alex/api.git`, `https://github.com:443/alex/api.git`, `git@github.com:alex/api.git`, and `ssh://git@github.com:22/alex/api` all normalize to `github.com/alex/api`.
+- **Ports and path casing preserved**: non-default ports (such as `https://git.acme.example:8443/org/api.git` vs `:9443` or `ssh://git@git.acme.example:2222/org/api.git`) and repository path capitalization (`Org/Repo` vs `org/repo`) stay distinct in the identity so arbitrary Git servers never merge separate repositories.
 - **Nested paths**: subgroups like `https://git.acme.example/platform/billing/api.git` keep the full path `git.acme.example/platform/billing/api`.
 - **Collision-free, path-safe filenames**: each remote maps to `<readable-slug>--<hash10>` (only `[a-z0-9-]`, bounded length for Windows and POSIX). Credentials in URLs are stripped before hashing and redacted from CLI output.
 - **No-remote fallback**: folders without an `origin` remote resolve to `local--<folder-slug>`, which cannot collide with remote IDs. Windows drive paths (`C:\repos\app.git`) are treated as local paths rather than SSH `host:path`.
 
 ### Migrating existing personal projects without losing notes
 
-In `"projectIdentity": "remote"` mode, `pctx` never guesses a project by basename, so notes in `projects/api.md` will not be loaded by another remote also named `api`. Declare explicit migration aliases in `~/.pctx/config.json` for known repositories:
+In `"projectIdentity": "remote"` mode, `pctx` never guesses a project by basename, so notes in `projects/api.md` will not be loaded by another remote also named `api`. Declare explicit migration aliases in `~/.pctx/config.json` for known repositories using each remote's canonical path (`<host>[:<port>]/<Path>`, matching the repository's path casing and any non-default port if your provider requires an alias for differently cased URLs):
 
 ```json
 {

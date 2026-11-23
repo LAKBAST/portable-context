@@ -7,7 +7,31 @@ const DOMAIN_HOST = /^(?:localhost|\[[0-9a-fA-F:]+\]|[a-zA-Z0-9-]+(?:\.[a-zA-Z0-
 const REMOTE_ID_PATTERN = /^[a-z0-9-]+--[0-9a-f]{10}$/;
 const LOCAL_ID_PATTERN = /^local--[a-z0-9-]+$/;
 const ALLOWED_SCHEMES = new Set(['http:', 'https:', 'ssh:', 'git:', 'git+ssh:', 'git+https:', 'file:']);
+const DEFAULT_PORTS = {
+  'http:': '80',
+  'https:': '443',
+  'git+https:': '443',
+  'ssh:': '22',
+  'git+ssh:': '22',
+  'git:': '9418',
+};
 const TRAVERSAL_SEGMENT = /(?:^|[\\/])(?:\.|%2e){1,2}(?:[\\/]|$)/i;
+
+function formatRemoteHost(hostname, port, protocol = null) {
+  const lower = hostname.toLowerCase();
+  if (!port) return lower;
+  if (port === '0') return null;
+  if (protocol && DEFAULT_PORTS[protocol] === port) return lower;
+  return `${lower}:${port}`;
+}
+
+function parseHostWithPort(raw) {
+  const m = /^(\[[0-9a-fA-F:]+\]|[a-zA-Z0-9-]+(?:\.[a-zA-Z0-9-]+)+):([1-9]\d{0,4})$/.exec(raw);
+  if (!m) return null;
+  const portNum = Number(m[2]);
+  if (!DOMAIN_HOST.test(m[1]) || portNum < 1 || portNum > 65535) return null;
+  return `${m[1].toLowerCase()}:${m[2]}`;
+}
 
 export function slug(value) {
   const cleaned = String(value ?? '')
@@ -70,7 +94,7 @@ function cleanRemoteSegments(rawSegments, { stripGit = true } = {}) {
     segments[segments.length - 1] = segments[segments.length - 1].replace(/\.git$/i, '');
     if (!segments[segments.length - 1]) return null;
   }
-  return segments.map((s) => s.toLowerCase());
+  return segments;
 }
 
 export function parseRemote(raw, { allowShorthand = false } = {}) {
@@ -132,14 +156,31 @@ export function parseRemote(raw, { allowShorthand = false } = {}) {
       return { kind: 'local', host: '', path: normalized, canonical: `local:${normalized}` };
     }
 
-    const host = url.hostname.toLowerCase();
-    if (!host || host.includes('*')) return null;
+    if (!url.hostname || url.hostname.includes('*')) return null;
+    const host = formatRemoteHost(url.hostname, url.port, url.protocol);
+    if (!host) return null;
     const rawPath = url.pathname;
     if (rawPath.includes('\\')) return null;
     const segments = cleanRemoteSegments(rawPath.split('/'));
     if (!segments) return null;
     const cleanPath = segments.join('/');
     return { kind: 'remote', host, path: cleanPath, canonical: `${host}/${cleanPath}` };
+  }
+
+  // Canonical shorthand with non-default port: host:port/org/repo (only when allowShorthand is true).
+  if (allowShorthand && !s.includes('@') && !s.includes('\\') && !s.includes('?') && !s.includes('#') && !s.includes('*')) {
+    const slashAt = s.indexOf('/');
+    if (slashAt > 0) {
+      const maybeHostPort = parseHostWithPort(s.slice(0, slashAt));
+      if (maybeHostPort) {
+        const rest = s.slice(slashAt + 1);
+        if (TRAVERSAL_SEGMENT.test(rest)) return null;
+        const segments = cleanRemoteSegments(rest.split('/'));
+        if (!segments) return null;
+        const cleanPath = segments.join('/');
+        return { kind: 'remote', host: maybeHostPort, path: cleanPath, canonical: `${maybeHostPort}/${cleanPath}` };
+      }
+    }
   }
 
   // SCP-like syntax: [user@]host:path (without @, require a valid domain/IPv6 host so URIs like javascript:x are rejected)
@@ -194,26 +235,33 @@ export function parseNamespace(raw) {
       return null;
     }
     if (!ALLOWED_SCHEMES.has(url.protocol) || url.protocol === 'file:') return null;
-    const host = url.hostname.toLowerCase();
-    if (!host || (url.pathname && url.pathname !== '/')) return null;
+    if (!url.hostname || url.hostname.includes('*') || (url.pathname && url.pathname !== '/')) return null;
+    const host = formatRemoteHost(url.hostname, url.port, url.protocol);
+    if (!host) return null;
     return { kind: 'remote', host, path: '', canonical: host };
   }
 
-  // Host-only namespace without scheme: git.example.com
+  // Host-only namespace without scheme: git.example.com or git.example.com:8443
   if (DOMAIN_HOST.test(s)) {
     const host = s.toLowerCase();
     return { kind: 'remote', host, path: '', canonical: host };
+  }
+  const hostWithPort = parseHostWithPort(s);
+  if (hostWithPort) {
+    return { kind: 'remote', host: hostWithPort, path: '', canonical: hostWithPort };
   }
 
   return null;
 }
 
-export function matchesNamespace(remoteParsed, nsParsed) {
+export function matchesNamespace(remoteParsed, nsParsed, { caseInsensitivePath = false } = {}) {
   if (!remoteParsed || !nsParsed || remoteParsed.kind !== nsParsed.kind) return false;
   if (remoteParsed.host !== nsParsed.host) return false;
   if (!nsParsed.path) return true;
-  const prefix = nsParsed.path === '/' ? '/' : `${nsParsed.path}/`;
-  return remoteParsed.path === nsParsed.path || remoteParsed.path.startsWith(prefix);
+  const remotePath = caseInsensitivePath ? remoteParsed.path.toLowerCase() : remoteParsed.path;
+  const nsPath = caseInsensitivePath ? nsParsed.path.toLowerCase() : nsParsed.path;
+  const prefix = nsPath === '/' ? '/' : `${nsPath}/`;
+  return remotePath === nsPath || remotePath.startsWith(prefix);
 }
 
 export function remoteProjectId(parsed) {
@@ -302,15 +350,19 @@ export function hasScopeRules(team) {
     (Array.isArray(team?.namespaces) && team.namespaces.length > 0);
 }
 
-export function teamMatchesRemote(team, remoteParsed) {
+export function teamMatchesRemote(team, remoteParsed, { caseInsensitivePath = false } = {}) {
   if (!remoteParsed || !team) return false;
   for (const raw of team.remotes ?? []) {
     const parsed = parseRemote(raw, { allowShorthand: true });
-    if (parsed && parsed.canonical === remoteParsed.canonical) return true;
+    if (!parsed || parsed.kind !== remoteParsed.kind || parsed.host !== remoteParsed.host) continue;
+    const match = caseInsensitivePath
+      ? parsed.path.toLowerCase() === remoteParsed.path.toLowerCase()
+      : parsed.path === remoteParsed.path;
+    if (match) return true;
   }
   for (const raw of team.namespaces ?? []) {
     const ns = parseNamespace(raw);
-    if (ns && matchesNamespace(remoteParsed, ns)) return true;
+    if (ns && matchesNamespace(remoteParsed, ns, { caseInsensitivePath })) return true;
   }
   return false;
 }
@@ -343,7 +395,9 @@ function validateAliases(aliases, label, isolatedTeams, ownTeam = null) {
         throw new Error(`Alias "${key}" in team ${ownTeam.name} points outside that team's scope`);
       }
     } else {
-      const hit = isolatedTeams.find((t) => teamMatchesRemote(t, parsed));
+      const hit = isolatedTeams.find(
+        (t) => teamMatchesRemote(t, parsed) || teamMatchesRemote(t, parsed, { caseInsensitivePath: true }),
+      );
       if (hit) {
         throw new Error(`Personal alias "${key}" cannot point to isolated team ${hit.name}`);
       }

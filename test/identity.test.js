@@ -21,23 +21,48 @@ afterEach(() => {
   }
 });
 
-test('parseRemote treats HTTPS, SSH, SCP, and nested paths consistently', () => {
+test('parseRemote treats HTTPS, SSH, SCP, and nested paths consistently for default ports', () => {
   const variants = [
     'https://git.acme.example/Platform/Billing/API.git',
-    'https://alice:s3cr3t-token@git.acme.example:8443/platform/billing/api.git/',
-    'ssh://git@git.acme.example:2222/platform/billing/api.git',
-    'git@git.acme.example:platform/billing/api.git',
-    'git@git.acme.example:/platform/billing/api',
+    'https://alice:s3cr3t-token@git.acme.example:443/Platform/Billing/API.git/',
+    'ssh://git@git.acme.example/Platform/Billing/API.git',
+    'ssh://git@git.acme.example:22/Platform/Billing/API.git',
+    'git@git.acme.example:Platform/Billing/API.git',
+    'git@git.acme.example:/Platform/Billing/API',
   ];
   const parsed = variants.map((u) => parseRemote(u));
   for (const item of parsed) {
     assert.ok(item);
     assert.equal(item.kind, 'remote');
-    assert.equal(item.canonical, 'git.acme.example/platform/billing/api');
+    assert.equal(item.canonical, 'git.acme.example/Platform/Billing/API');
   }
   const ids = new Set(parsed.map((item) => remoteProjectId(item)));
   assert.equal(ids.size, 1);
   assert.match([...ids][0], /^[a-z0-9-]+--[0-9a-f]{10}$/);
+});
+
+test('parseRemote preserves path capitalization and non-default ports', () => {
+  const upper = parseRemote('https://git.acme.example/Platform/Billing/API.git');
+  const lower = parseRemote('https://git.acme.example/platform/billing/api.git');
+  assert.equal(upper.canonical, 'git.acme.example/Platform/Billing/API');
+  assert.equal(lower.canonical, 'git.acme.example/platform/billing/api');
+  assert.notEqual(remoteProjectId(upper), remoteProjectId(lower));
+
+  const ports = [
+    parseRemote('https://git.acme.example/platform/api.git'),
+    parseRemote('https://git.acme.example:8443/platform/api.git'),
+    parseRemote('https://git.acme.example:9443/platform/api.git'),
+    parseRemote('ssh://git@git.acme.example:2222/platform/api.git'),
+    parseRemote('ssh://git@git.acme.example:2223/platform/api.git'),
+  ];
+  const canonicals = new Set(ports.map((p) => p.canonical));
+  const ids = new Set(ports.map((p) => remoteProjectId(p)));
+  assert.equal(canonicals.size, 5);
+  assert.equal(ids.size, 5);
+  assert.equal(
+    parseRemote('git.acme.example:8443/platform/api', { allowShorthand: true })?.canonical,
+    'git.acme.example:8443/platform/api',
+  );
 });
 
 test('parseRemote handles Windows local paths without confusing drive letters for SSH hosts', () => {
@@ -110,6 +135,16 @@ test('parseNamespace and matchesNamespace enforce segment boundaries and reject 
   const hostNs = parseNamespace('git.acme.example/*');
   assert.ok(hostNs);
   assert.ok(matchesNamespace(parseRemote('https://git.acme.example/any/repo.git'), hostNs));
+  assert.ok(!matchesNamespace(parseRemote('https://git.acme.example:8443/any/repo.git'), hostNs));
+
+  const portNs = parseNamespace('git.acme.example:8443/Platform');
+  assert.ok(portNs);
+  assert.ok(matchesNamespace(parseRemote('https://git.acme.example:8443/Platform/api.git'), portNs));
+  assert.ok(!matchesNamespace(parseRemote('https://git.acme.example:9443/Platform/api.git'), portNs));
+  assert.ok(!matchesNamespace(parseRemote('https://git.acme.example/Platform/api.git'), portNs));
+  assert.ok(!matchesNamespace(parseRemote('https://git.acme.example:8443/platform/api.git'), portNs));
+  assert.ok(matchesNamespace(parseRemote('https://git.acme.example:8443/platform/api.git'), portNs, { caseInsensitivePath: true }));
+  assert.ok(!matchesNamespace(parseRemote('https://git.acme.example:8443/platform-v2/api.git'), portNs, { caseInsensitivePath: true }));
 
   for (const bad of ['*', '*/*', 'acme', 'git.acme.example/*/api', '']) {
     assert.equal(parseNamespace(bad), null, `expected null for ${bad}`);
