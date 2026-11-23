@@ -92,7 +92,9 @@ export function resolveScanRules(rules, label = 'scanRules') {
     if (typeof entry !== 'string' || !entry.trim()) {
       throw new Error(`${label} entries must be non-empty rule ID strings (valid IDs: ${VALID_RULE_IDS_TEXT})`);
     }
-    const expanded = RULE_COLLECTIONS[entry] ?? (PERSONAL_DATA_RULES.has(entry) ? [entry] : null);
+    const expanded = Object.hasOwn(RULE_COLLECTIONS, entry)
+      ? RULE_COLLECTIONS[entry]
+      : PERSONAL_DATA_RULES.has(entry) ? [entry] : null;
     if (!expanded) {
       throw new Error(`Unknown rule "${entry}" in ${label} (valid IDs: ${VALID_RULE_IDS_TEXT})`);
     }

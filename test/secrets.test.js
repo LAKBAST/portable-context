@@ -140,6 +140,9 @@ test('resolveScanRules expands collections, deduplicates, and rejects invalid na
   for (const bad of ['es-pii', 42, null, {}, [''], [123], ['unknown-rule'], ['es-dni '], ['/\\d+/']]) {
     assert.throws(() => resolveScanRules(bad, 'testRules'));
   }
+  for (const inheritedName of ['constructor', 'toString', '__proto__']) {
+    assert.throws(() => resolveScanRules([inheritedName], 'testRules'), /Unknown rule/);
+  }
 });
 
 test('scanDiff keeps personal data disabled by default while blocking GOCSPX- globally', () => {
