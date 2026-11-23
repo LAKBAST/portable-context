@@ -11,6 +11,7 @@ import {
   redactText,
   redactUrl,
   remoteProjectId,
+  resolveLimits,
   localProjectId,
   validateConfig,
 } from '../src/identity.js';
@@ -204,4 +205,22 @@ test('validateConfig checks per-repo scanRules and privateScanRules', () => {
       }),
     /without privateDir/,
   );
+});
+
+test('resolveLimits and validateConfig enforce bounded positive integers for per-file limits', () => {
+  assert.deepEqual(resolveLimits({}), { profile: 3000, project: 4000, decision: 1500 });
+  assert.deepEqual(resolveLimits({ limits: { decision: 2200 } }), { profile: 3000, project: 4000, decision: 2200 });
+  assert.doesNotThrow(() => validateConfig({ limits: { profile: 1, project: 100_000, decision: 500 } }));
+
+  for (const badLimits of [null, '3000', [], 42]) {
+    assert.throws(() => validateConfig({ limits: badLimits }), /Invalid limits in config\.json/);
+  }
+  assert.throws(() => validateConfig({ limits: { decisions: 500 } }), /Unknown key "decisions"/);
+  assert.throws(() => validateConfig({ limits: JSON.parse('{"__proto__": 10}') }), /Unknown key "__proto__"/);
+
+  for (const badVal of [0, -1, 1.5, '3000', true, null, 100_001]) {
+    assert.throws(() => validateConfig({ limits: { profile: badVal } }), /Invalid limits\.profile/);
+    assert.throws(() => validateConfig({ limits: { project: badVal } }), /Invalid limits\.project/);
+    assert.throws(() => validateConfig({ limits: { decision: badVal } }), /Invalid limits\.decision/);
+  }
 });

@@ -4,6 +4,7 @@ import os from 'node:os';
 import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
+  DEFAULT_LIMITS,
   hasScopeRules,
   isCanonicalProjectId,
   isInsideDir,
@@ -13,6 +14,7 @@ import {
   redactText,
   redactUrl,
   remoteProjectId,
+  resolveLimits,
   slug,
   teamMatchesRemote,
   validateConfig,
@@ -41,9 +43,6 @@ const MIN_REFRESH_TIME = 2_000;
 const REFRESH_PUSH_TIMEOUT = 10_000;
 const SYNC_PUSH_TIMEOUT = 60_000;
 const CLONE_TIMEOUT = 120_000;
-const PROFILE_MAX = 3000;
-const PROJECT_MAX = 4000;
-const DECISION_MAX = 1500;
 const DECISIONS_INDEX_MAX_ITEMS = 20;
 const DECISIONS_INDEX_MAX_CHARS = 1500;
 const RECENT_SESSIONS = 3;
@@ -956,7 +955,7 @@ function formatScopedBody({ primaryFile, primaryText, aliasFile, aliasText }, ma
   return emptyText;
 }
 
-function projectDecisionSections(repos, projectId, alias, decisionMax = DECISION_MAX) {
+function projectDecisionSections(repos, projectId, alias, decisionMax = DEFAULT_LIMITS.decision) {
   if (!projectId) return [];
   const sections = [];
   for (const repo of repos) {
@@ -967,28 +966,35 @@ function projectDecisionSections(repos, projectId, alias, decisionMax = DECISION
   return sections;
 }
 
-function profileSection(dir, heading = 'Profile') {
+function profileSection(dir, heading = 'Profile', profileMax = DEFAULT_LIMITS.profile) {
   const file = join(dir, 'AGENTS.md');
   const text = readIfExists(file);
-  return text ? [`## ${heading}\n\n${truncate(text, PROFILE_MAX, file)}`] : [];
+  return text ? [`## ${heading}\n\n${truncate(text, profileMax, file)}`] : [];
 }
 
-function projectSection(dir, projectId, display, alias) {
+function projectSection(dir, projectId, display, alias, projectMax = DEFAULT_LIMITS.project) {
   if (!projectId) return [];
   const header = `## Current project: ${projectId}`;
   const remoteLine = display && display !== projectId ? `Remote: ${display}\n\n` : '';
   const data = readScopedMarkdown(dir, 'projects', projectId, alias);
-  const body = formatScopedBody(data, PROJECT_MAX, 'notes', `No notes yet (${data.primaryFile}).`);
+  const body = formatScopedBody(data, projectMax, 'notes', `No notes yet (${data.primaryFile}).`);
   return [`${header}\n\n${remoteLine}${body}`];
 }
 
-function teamProjectSections(privateDir, team, projectId, display, alias, { includePrivate = true } = {}) {
+function teamProjectSections(
+  privateDir,
+  team,
+  projectId,
+  display,
+  alias,
+  { includePrivate = true, profileMax = DEFAULT_LIMITS.profile, projectMax = DEFAULT_LIMITS.project } = {},
+) {
   const data = readScopedMarkdown(team.dir, 'projects', projectId, alias);
   const sections = [];
   const teamProfile = readIfExists(join(team.dir, 'AGENTS.md'));
-  if (teamProfile) sections.push(`## Team ${team.name}\n\n${truncate(teamProfile, PROFILE_MAX, join(team.dir, 'AGENTS.md'))}`);
+  if (teamProfile) sections.push(`## Team ${team.name}\n\n${truncate(teamProfile, profileMax, join(team.dir, 'AGENTS.md'))}`);
   const remoteLine = display && display !== projectId ? `Remote: ${display}\n\n` : '';
-  const body = formatScopedBody(data, PROJECT_MAX, 'notes', `No notes yet (${data.primaryFile}).`);
+  const body = formatScopedBody(data, projectMax, 'notes', `No notes yet (${data.primaryFile}).`);
   sections.push(
     `## Current project: ${projectId} (shared in team ${team.name})\n\n` +
       remoteLine +
@@ -997,7 +1003,7 @@ function teamProjectSections(privateDir, team, projectId, display, alias, { incl
   );
   if (includePrivate && privateDir) {
     const priv = readScopedMarkdown(privateDir, 'projects', projectId, alias);
-    const privBody = formatScopedBody(priv, PROJECT_MAX, 'notes');
+    const privBody = formatScopedBody(priv, projectMax, 'notes');
     if (privBody) sections.push(`## Your private notes for ${projectId}\n\n${privBody}`);
   }
   return sections;
@@ -1031,7 +1037,7 @@ function excludedNames(projectId, alias) {
   return excluded;
 }
 
-function buildIsolatedContext(team, resolved, teamResults, privateResult) {
+function buildIsolatedContext(team, resolved, teamResults, privateResult, limits = DEFAULT_LIMITS) {
   const projectId = resolved.projectId;
   const excluded = excludedNames(projectId, resolved.alias);
   const others = markdownFiles(join(team.dir, 'projects')).filter((name) => !excluded.has(name));
@@ -1055,11 +1061,13 @@ function buildIsolatedContext(team, resolved, teamResults, privateResult) {
     ...(team.privateDir ? [`Private repo: ${team.privateDir}`] : []),
     ...warningLine(`team ${team.name}`, teamResults[team.name]),
     ...(team.privateDir ? warningLine(`private ${team.name}`, privateResult) : []),
-    ...(privateUsable ? profileSection(team.privateDir, `Your private profile (team ${team.name})`) : []),
+    ...(privateUsable ? profileSection(team.privateDir, `Your private profile (team ${team.name})`, limits.profile) : []),
     ...teamProjectSections(team.privateDir, team, projectId, resolved.display, resolved.alias, {
       includePrivate: privateUsable,
+      profileMax: limits.profile,
+      projectMax: limits.project,
     }),
-    ...projectDecisionSections(decisionRepos, projectId, resolved.alias),
+    ...projectDecisionSections(decisionRepos, projectId, resolved.alias, limits.decision),
     ...listSection('Other projects', others),
     ...decisionsIndexSection(decisionRepos),
     ...listSection(`Recent team sessions for this project (${join(team.dir, 'sessions')})`, teamSessions),
@@ -1071,9 +1079,10 @@ function buildIsolatedContext(team, resolved, teamResults, privateResult) {
 
 // `teamResults` maps a team name to the result of refreshing that team repo.
 export function buildContext(config, cwd, syncResult, teamResults = {}, extra = {}) {
+  const limits = resolveLimits(config);
   const resolved = extra.resolved ?? resolveScope(config, { cwd, allowConflict: true });
   if (resolved.scopeKind === 'isolated' && resolved.isolatedTeam && !resolved.conflict) {
-    return buildIsolatedContext(resolved.isolatedTeam, resolved, teamResults, extra.privateResult);
+    return buildIsolatedContext(resolved.isolatedTeam, resolved, teamResults, extra.privateResult, limits);
   }
   if (resolved.conflict && (resolved.scopeKind === 'isolated' || resolved.isolatedTeam)) {
     return `Portable context unavailable: ${resolved.conflict}`;
@@ -1111,11 +1120,14 @@ export function buildContext(config, cwd, syncResult, teamResults = {}, extra = 
     ...warningLine('the context', syncResult),
     ...nonIsolatedTeams.flatMap((t) => warningLine(`team ${t.name}`, teamResults[t.name])),
     ...(resolved.conflict ? [`WARNING: ${resolved.conflict}. Tell the user.`] : []),
-    ...profileSection(dir),
+    ...profileSection(dir, 'Profile', limits.profile),
     ...(team
-      ? teamProjectSections(dir, team, projectId, resolved.display, resolved.alias)
-      : projectSection(dir, projectId, resolved.display, resolved.alias)),
-    ...projectDecisionSections(decisionAutoloadRepos, projectId, resolved.alias),
+      ? teamProjectSections(dir, team, projectId, resolved.display, resolved.alias, {
+          profileMax: limits.profile,
+          projectMax: limits.project,
+        })
+      : projectSection(dir, projectId, resolved.display, resolved.alias, limits.project)),
+    ...projectDecisionSections(decisionAutoloadRepos, projectId, resolved.alias, limits.decision),
     ...listSection('Other projects', others),
     ...decisionsIndexSection(decisionIndexRepos),
     ...listSection('Recent sessions for this project', recentSessions(dir, projectId, resolved.alias)),

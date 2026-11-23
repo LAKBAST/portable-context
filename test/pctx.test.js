@@ -1818,3 +1818,103 @@ test('decisions never follow symlinks escaping the repository, including a symli
   assert.ok(hFileLink.stdout.includes('valid-in-repo.md'));
   assert.ok(!hFileLink.stdout.includes('VALID-BODY'));
 });
+
+// ---------------------------------------------------------------- configurable per-file limits
+
+test('default and configured per-file limits truncate profile, project notes, and decisions while preserving links', () => {
+  const sb = makeSandbox();
+  const studioRemote = makeRemote(sb, 'studio-team');
+  const acmeRemote = makeRemote(sb, 'acme-team');
+  const acmePrivRemote = makeRemote(sb, 'acme-priv');
+  const alex = makeDevice(sb, 'alex-laptop');
+  setup(alex, sb, ['--author', 'alex', '--project-identity', 'remote']);
+  teamAdd(alex, 'studio', studioRemote);
+  teamAdd(alex, 'acme', acmeRemote, [
+    '--isolated',
+    '--namespace', 'git.acme.example/platform',
+    '--private-url', acmePrivRemote,
+  ]);
+
+  const personalProj = makeProjectRepo(alex, 'personal-app', 'https://github.com/alex/personal-app.git');
+  const sessPers = pctx(alex, ['session-path', '--cwd', personalProj]);
+  const persId = path.basename(sessPers.stdout.trim()).replace(/^\d{4}-\d{2}-\d{2}-\d{4}-/, '').replace(new RegExp(`-${alex.name}\\.md$`), '');
+
+  const profFile = path.join(alex.context, 'AGENTS.md');
+  const projFile = path.join(alex.context, 'projects', `${persId}.md`);
+  const decFile = path.join(alex.context, 'decisions', `${persId}.md`);
+  write(profFile, 'P'.repeat(3050));
+  write(projFile, 'N'.repeat(4050));
+  write(decFile, 'D'.repeat(1550));
+
+  // Default limits: 3000 / 4000 / 1500.
+  const hDefault = hook(alex, personalProj);
+  assert.equal(hDefault.status, 0);
+  assert.ok(hDefault.stdout.includes('P'.repeat(3000)));
+  assert.ok(!hDefault.stdout.includes('P'.repeat(3001)));
+  assert.ok(hDefault.stdout.includes(`[Truncated. Full file: ${profFile}]`));
+  assert.ok(hDefault.stdout.includes('N'.repeat(4000)));
+  assert.ok(!hDefault.stdout.includes('N'.repeat(4001)));
+  assert.ok(hDefault.stdout.includes(`[Truncated. Full file: ${projFile}]`));
+  assert.ok(hDefault.stdout.includes('D'.repeat(1500)));
+  assert.ok(!hDefault.stdout.includes('D'.repeat(1501)));
+  assert.ok(hDefault.stdout.includes(`[Truncated. Full file: ${decFile}]`));
+
+  // Custom limits apply to personal, non-isolated team, and isolated team + private profiles/notes/decisions.
+  updateConfig(alex, (cfg) => {
+    cfg.limits = { profile: 20, project: 30, decision: 10 };
+  });
+
+  const hCustom = hook(alex, personalProj);
+  assert.equal(hCustom.status, 0);
+  assert.ok(hCustom.stdout.includes('P'.repeat(20)));
+  assert.ok(!hCustom.stdout.includes('P'.repeat(21)));
+  assert.ok(hCustom.stdout.includes(`[Truncated. Full file: ${profFile}]`));
+  assert.ok(hCustom.stdout.includes('N'.repeat(30)));
+  assert.ok(!hCustom.stdout.includes('N'.repeat(31)));
+  assert.ok(hCustom.stdout.includes(`[Truncated. Full file: ${projFile}]`));
+  assert.ok(hCustom.stdout.includes('D'.repeat(10)));
+  assert.ok(!hCustom.stdout.includes('D'.repeat(11)));
+  assert.ok(hCustom.stdout.includes(`[Truncated. Full file: ${decFile}]`));
+
+  const corpRepo = makeProjectRepo(alex, 'corp-app', 'https://git.acme.example/platform/corp-app.git');
+  const sessCorp = pctx(alex, ['session-path', '--cwd', corpRepo]);
+  const corpId = path.basename(sessCorp.stdout.trim()).replace(/^\d{4}-\d{2}-\d{2}-\d{4}-/, '').replace(new RegExp(`-(?:alex-)?${alex.name}\\.md$`), '');
+  const acmeDir = path.join(alex.pctxHome, 'teams', 'acme');
+  const acmePrivDir = path.join(alex.pctxHome, 'teams', 'acme-private');
+  const teamProfFile = path.join(acmeDir, 'AGENTS.md');
+  const privProfFile = path.join(acmePrivDir, 'AGENTS.md');
+  const teamProjFile = path.join(acmeDir, 'projects', `${corpId}.md`);
+  const privDecFile = path.join(acmePrivDir, 'decisions', `${corpId}.md`);
+  write(teamProfFile, 'T'.repeat(50));
+  write(privProfFile, 'V'.repeat(50));
+  write(teamProjFile, 'C'.repeat(50));
+  write(privDecFile, 'X'.repeat(50));
+
+  const hCorp = hook(alex, corpRepo);
+  assert.equal(hCorp.status, 0);
+  assert.ok(hCorp.stdout.includes('T'.repeat(20)) && !hCorp.stdout.includes('T'.repeat(21)));
+  assert.ok(hCorp.stdout.includes(`[Truncated. Full file: ${teamProfFile}]`));
+  assert.ok(hCorp.stdout.includes('V'.repeat(20)) && !hCorp.stdout.includes('V'.repeat(21)));
+  assert.ok(hCorp.stdout.includes(`[Truncated. Full file: ${privProfFile}]`));
+  assert.ok(hCorp.stdout.includes('C'.repeat(30)) && !hCorp.stdout.includes('C'.repeat(31)));
+  assert.ok(hCorp.stdout.includes(`[Truncated. Full file: ${teamProjFile}]`));
+  assert.ok(hCorp.stdout.includes('X'.repeat(10)) && !hCorp.stdout.includes('X'.repeat(11)));
+  assert.ok(hCorp.stdout.includes(`[Truncated. Full file: ${privDecFile}]`));
+
+  // Invalid limits fail cleanly in doctor/sync and emit clear message in hook while exiting 0.
+  updateConfig(alex, (cfg) => {
+    cfg.limits = { decision: 0 };
+  });
+  const doc = pctx(alex, ['doctor']);
+  assert.equal(doc.status, 0);
+  assert.match(doc.stdout, /Config problem: Invalid limits\.decision/);
+  const syncRes = pctx(alex, ['sync', '--cwd', personalProj]);
+  assert.equal(syncRes.status, 1);
+  assert.match(syncRes.stderr, /Invalid limits\.decision/);
+  const hBad = hook(alex, personalProj);
+  assert.equal(hBad.status, 0);
+  assert.match(hBad.stdout, /^Portable context unavailable: Invalid limits\.decision/);
+
+  // Codex additionalContextLimit integration rule stays unchanged at 9000.
+  assert.equal(readJson(path.join(alex.codex, 'hooks.json')).hooks.SessionStart[0].hooks[0].additionalContextLimit, 9000);
+});

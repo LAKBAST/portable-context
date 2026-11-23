@@ -147,6 +147,25 @@ When `decisions/*.md` files exist in the repositories of the current project sco
 - **Project decision autoload**: `decisions/<project-id>.md` (and `decisions/<alias>.md` when an explicit migration alias matches the current remote) is loaded automatically for the current project, separated per repository without mixing repos or guessing ambiguous short names.
 - **Symlink safety**: symlinks or junctions pointing outside the repository (including a `decisions/` directory linked to another scope) are ignored.
 
+### Configurable per-file limits
+
+You can override the character truncation limits per loaded file in `~/.pctx/config.json`:
+
+```json
+{
+  "limits": {
+    "profile": 3000,
+    "project": 4000,
+    "decision": 1500
+  }
+}
+```
+
+- `profile` (default `3000`): applies to personal, team, and isolated private `AGENTS.md` files.
+- `project` (default `4000`): applies to personal, team, and private `projects/<id>.md` (and legacy alias) files.
+- `decision` (default `1500`): applies to autoloaded `decisions/<id>.md` (and legacy alias) files.
+- Each value must be a positive integer between `1` and `100000`. Truncated sections always keep the `[Truncated. Full file: <path>]` link to the full file. Integration-level hook limits (such as Codex's `additionalContextLimit`) are unchanged.
+
 ## Isolated teams and private destinations
 
 You can optionally isolate any team by binding it to exact remotes or explicit namespaces on any Git server, with an optional dedicated private repo (`privateDir`) completely separate from your personal context repo:
