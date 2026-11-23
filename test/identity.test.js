@@ -12,6 +12,7 @@ import {
   redactText,
   redactUrl,
   remoteProjectId,
+  resolveHookRefreshSeconds,
   resolveLimits,
   resolveStaleSaveDays,
   localProjectId,
@@ -248,4 +249,16 @@ test('resolveStaleSaveDays and validateConfig validate staleSaveDays bounds and 
   const outside = path.join(path.dirname(root), 'other', 'app.md');
   assert.ok(isInsideDir(inside, root));
   assert.ok(!isInsideDir(outside, root));
+});
+
+test('resolveHookRefreshSeconds and validateConfig enforce bounded non-negative integers', () => {
+  assert.equal(resolveHookRefreshSeconds({}), 120);
+  assert.equal(resolveHookRefreshSeconds({ hookRefreshSeconds: 0 }), 0);
+  assert.equal(resolveHookRefreshSeconds({ hookRefreshSeconds: 86_400 }), 86_400);
+  assert.doesNotThrow(() => validateConfig({ hookRefreshSeconds: 0 }));
+  assert.doesNotThrow(() => validateConfig({ hookRefreshSeconds: 300 }));
+
+  for (const badSeconds of [-1, 1.5, '120', null, true, false, {}, [], 86_401, Number.NaN, Infinity]) {
+    assert.throws(() => validateConfig({ hookRefreshSeconds: badSeconds }), /Invalid hookRefreshSeconds/);
+  }
 });
