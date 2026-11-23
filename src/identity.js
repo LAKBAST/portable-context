@@ -12,6 +12,8 @@ export const DEFAULT_LIMITS = { profile: 3000, project: 4000, decision: 1500 };
 export const MAX_FILE_LIMIT = 100_000;
 export const DEFAULT_STALE_SAVE_DAYS = 7;
 export const MAX_STALE_SAVE_DAYS = 3650;
+export const DEFAULT_HOOK_REFRESH_SECONDS = 120;
+export const MAX_HOOK_REFRESH_SECONDS = 86_400;
 const LIMIT_KEYS = new Set(Object.keys(DEFAULT_LIMITS));
 const DEFAULT_PORTS = {
   'http:': '80',
@@ -512,6 +514,17 @@ export function resolveStaleSaveDays(config) {
   return raw;
 }
 
+export function resolveHookRefreshSeconds(config) {
+  const raw = config?.hookRefreshSeconds;
+  if (raw === undefined) return DEFAULT_HOOK_REFRESH_SECONDS;
+  if (!Number.isInteger(raw) || raw < 0 || raw > MAX_HOOK_REFRESH_SECONDS) {
+    throw new Error(
+      `Invalid hookRefreshSeconds in config.json: expected an integer between 0 and ${MAX_HOOK_REFRESH_SECONDS} (0 disables)`,
+    );
+  }
+  return raw;
+}
+
 export function validateConfig(config, gitFn = null) {
   if (!config || typeof config !== 'object') {
     return {
@@ -520,6 +533,7 @@ export function validateConfig(config, gitFn = null) {
       teamAliases: new Map(),
       limits: { ...DEFAULT_LIMITS },
       staleSaveDays: DEFAULT_STALE_SAVE_DAYS,
+      hookRefreshSeconds: DEFAULT_HOOK_REFRESH_SECONDS,
     };
   }
   const mode = config.projectIdentity ?? 'legacy';
@@ -528,6 +542,7 @@ export function validateConfig(config, gitFn = null) {
   }
   const limits = resolveLimits(config);
   const staleSaveDays = resolveStaleSaveDays(config);
+  const hookRefreshSeconds = resolveHookRefreshSeconds(config);
   resolveScanRules(config.scanRules, 'scanRules in config.json');
   const teams = Array.isArray(config.teams) ? config.teams : [];
   const seenNames = new Set();
@@ -612,7 +627,7 @@ export function validateConfig(config, gitFn = null) {
   for (const team of teams) {
     teamAliases.set(team.name, validateAliases(team.aliases, `teams[${team.name}].aliases`, isolatedTeams, team));
   }
-  return { mode, personalAliases, teamAliases, limits, staleSaveDays };
+  return { mode, personalAliases, teamAliases, limits, staleSaveDays, hookRefreshSeconds };
 }
 
 export function validatePrivateDestination(config, team, gitFn) {

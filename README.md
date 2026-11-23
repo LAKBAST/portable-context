@@ -175,6 +175,16 @@ By default, `pctx hook` checks the calendar date in standard session filenames (
 - If no saved session exists yet for the project, no reminder is shown.
 - `pctx` never infers that the active session is unsaved and never saves automatically.
 
+### Hook refresh interval and compaction
+
+To avoid repeated `git pull` / `git push` runs when sessions open, resume, or clear in quick succession, `pctx hook` caches the last successful refresh timestamp per context repo clone under `$PCTX_HOME/hook-refresh/` (outside versioned repos, keyed by a hash of the clone path and origin without storing URLs or credentials):
+
+- `hookRefreshSeconds` (default `120`, valid integers `0` to `86400`): minimum age in seconds before `pctx hook` refreshes a clone again on `startup`, `resume`, `clear`, or payloads without `source` (such as Antigravity's `workspacePaths` payload).
+- Set `"hookRefreshSeconds": 0` in `~/.pctx/config.json` to disable the interval so every non-compact hook refreshes.
+- Only a refresh that completes cleanly (including pushing any pending local commits) updates that clone's timestamp; failed refreshes are not cached and are retried on the next non-compact hook.
+- **Compaction (`source: "compact"`)**: when Claude Code or Codex invokes the SessionStart hook for compaction, `pctx hook` skips all `pull`, `fetch`, and `push` operations across every repo (even when the cache is empty or `hookRefreshSeconds` is `0`) and outputs only the local context for the active scope.
+- **Manual `pctx sync`**: `pctx sync` ignores `hookRefreshSeconds` and the hook cache and always scans, commits, pulls, and pushes explicitly when run.
+
 ## Isolated teams and private destinations
 
 You can optionally isolate any team by binding it to exact remotes or explicit namespaces on any Git server, with an optional dedicated private repo (`privateDir`) completely separate from your personal context repo:
@@ -242,7 +252,7 @@ How isolated teams behave across commands:
 | `pctx install` | Install the hook and skill into Claude Code, Codex and Antigravity, and the Codex rule for `pctx sync` |
 | `pctx uninstall` | Remove the hook, skill and Codex rule that pctx installed |
 | `pctx doctor` | Check the configuration, scope rules, private destinations, and installation |
-| `pctx hook [--format antigravity]` | SessionStart hook: reads `{cwd}` (or Antigravity's `workspacePaths`) JSON on stdin, pulls the active scope, prints context (as `injectSteps` JSON with `--format antigravity`). Always exits 0 |
+| `pctx hook [--format antigravity]` | SessionStart hook: reads `{cwd}` (or Antigravity's `workspacePaths`) JSON on stdin, refreshes each active-scope repo if its `hookRefreshSeconds` interval (default `120` s) elapsed (skipped when `source` is `"compact"`), prints context (as `injectSteps` JSON with `--format antigravity`). Always exits 0 |
 | `pctx session-path [--project] [--cwd] [--team] [--private]` | Print a new session file path and create `sessions/` (in the team repo for a shared/isolated project; `--private` uses your personal repo or the isolated team's `privateDir`) |
 | `pctx sync [-m] [--cwd] [--team]` | Scan, commit, pull and push the active scope (personal + non-isolated teams, or the isolated team + its `privateDir`). Prints `synced` or `up-to-date` |
 | `pctx scan [--cwd] [--team]` | Scan pending changes in the active scope for secrets and configured rules: `clean` or findings |
